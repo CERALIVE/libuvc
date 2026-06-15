@@ -599,7 +599,9 @@ static int _uvc_stream_params_negotiated(
   uvc_stream_ctrl_t *actual) {
     return required->bFormatIndex == actual->bFormatIndex &&
     required->bFrameIndex == actual->bFrameIndex &&
-    required->dwMaxPayloadTransferSize == actual->dwMaxPayloadTransferSize;
+    /* Backport upstream 047920b (#273): the #178 equality check was too strict.
+     * Some HighSpeed USB cameras return a smaller Max payload than requested. */
+    required->dwMaxPayloadTransferSize >= actual->dwMaxPayloadTransferSize;
 }
 
 /** @internal
