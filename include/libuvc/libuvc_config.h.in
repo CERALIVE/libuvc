@@ -19,4 +19,6 @@
 
 #cmakedefine LIBUVC_HAS_JPEG 1
 
+#cmakedefine01 LIBUVC_AUTO_DETACH_KERNEL_DRIVER
+
 #endif // !def(LIBUVC_CONFIG_H)

@@ -296,6 +296,18 @@ uvc_error_t uvc_wrap(
     return err;
   }
 
+#if LIBUVC_AUTO_DETACH_KERNEL_DRIVER
+  /* Auto-detach any kernel driver (e.g. uvcvideo) when we claim interfaces.
+   * Without this, uvc_open_internal will fail because the
+   * kernel driver is still bound to the device UVC interfaces.
+   *
+   * CeraLive: this behavior is configurable via the
+   * LIBUVC_AUTO_DETACH_KERNEL_DRIVER CMake option (default ON). Consumers
+   * that manage kernel-driver detach themselves can build with
+   * -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=OFF to disable it. */
+  libusb_set_auto_detach_kernel_driver(usb_devh, 1);
+#endif
+
   dev = calloc(1, sizeof(uvc_device_t));
   dev->ctx = context;
   dev->usb_dev = libusb_get_device(usb_devh);
@@ -1137,6 +1149,8 @@ uvc_error_t uvc_parse_vc_header(uvc_device_t *dev,
     info->ctrl_if.dwClockFrequency = DW_TO_INT(block + 7);
     break;
   case 0x0110:
+    break;
+  case 0x0150:
     break;
   default:
     UVC_EXIT(UVC_ERROR_NOT_SUPPORTED);
