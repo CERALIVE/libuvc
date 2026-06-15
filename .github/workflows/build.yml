@@ -1,0 +1,67 @@
+name: Build Check
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libusb-1.0-0-dev libjpeg-dev
+
+      - name: Configure (auto-detach ON)
+        run: |
+          cmake -B build \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_TEST=OFF \
+            -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify capabilities present
+        run: |
+          echo "=== H.265 support ==="
+          grep -r "UVC_FRAME_FORMAT_H265" include/ && echo "PASS: H265 enum present"
+
+          echo "=== UVC 1.5 header ==="
+          grep -r "0x0150" src/ && echo "PASS: UVC 1.5 case present"
+
+          echo "=== Configurable auto-detach ==="
+          grep "LIBUVC_AUTO_DETACH_KERNEL_DRIVER" CMakeLists.txt && echo "PASS: auto-detach option present"
+
+      - name: Configure + build (auto-detach OFF — rollback path)
+        run: |
+          cmake -B build-off \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_TEST=OFF \
+            -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=OFF
+          cmake --build build-off --parallel
+          echo "PASS: OFF variant builds cleanly"
+
+      - name: Verify artifacts
+        run: |
+          test -f build/libuvc.so
+          echo "PASS: shared library produced"
+          test -f build/libuvc.a
+          echo "PASS: static library produced"
