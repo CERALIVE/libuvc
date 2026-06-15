@@ -135,12 +135,14 @@ struct format_table_entry *_get_format_entry(enum uvc_frame_format format) {
       {'R',  'G',  'G',  'B', 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71})
     FMT(UVC_FRAME_FORMAT_SBGGR8,
       {'B',  'G',  'G',  'R', 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71})
-    ABS_FMT(UVC_FRAME_FORMAT_COMPRESSED, 2,
-      {UVC_FRAME_FORMAT_MJPEG, UVC_FRAME_FORMAT_H264})
+    ABS_FMT(UVC_FRAME_FORMAT_COMPRESSED, 3,
+      {UVC_FRAME_FORMAT_MJPEG, UVC_FRAME_FORMAT_H264, UVC_FRAME_FORMAT_H265})
     FMT(UVC_FRAME_FORMAT_MJPEG,
       {'M',  'J',  'P',  'G'})
     FMT(UVC_FRAME_FORMAT_H264,
       {'H',  '2',  '6',  '4', 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71})
+    FMT(UVC_FRAME_FORMAT_H265,
+      {'H',  '2',  '6',  '5', 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71})
 
     default:
       return NULL;
@@ -1359,6 +1361,9 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
     frame->step = 0;
     break;
   case UVC_FRAME_FORMAT_H264:
+    frame->step = 0;
+    break;
+  case UVC_FRAME_FORMAT_H265:
     frame->step = 0;
     break;
   default:
