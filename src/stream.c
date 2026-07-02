@@ -280,6 +280,15 @@ uvc_error_t uvc_query_stream_ctrl(
         ctrl->dwMaxVideoFrameSize = frame->dwMaxVideoFrameBufferSize;
       }
     }
+
+    /* fall back to the descriptor value when GET_MAX yields a zero payload (issue #276) */
+    if (ctrl->dwMaxPayloadTransferSize == 0) {
+      uvc_frame_desc_t *frame = uvc_find_frame_desc(devh, ctrl->bFormatIndex, ctrl->bFrameIndex);
+
+      if (frame) {
+        ctrl->dwMaxPayloadTransferSize = frame->dwMaxBitRate;
+      }
+    }
   }
 
   return UVC_SUCCESS;
@@ -680,7 +689,10 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
   strmh->meta_outbuf = tmp_buf;
   strmh->meta_hold_bytes = strmh->meta_got_bytes;
 
-  pthread_cond_broadcast(&strmh->cb_cond);
+  /* suppress the whole frame if any of its payloads/packets reported an error */
+  if (!strmh->frame_had_errors)
+    pthread_cond_broadcast(&strmh->cb_cond);
+  strmh->frame_had_errors = 0;
   pthread_mutex_unlock(&strmh->cb_mutex);
 
   strmh->seq++;
@@ -753,6 +765,7 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
 
     if (header_info & 0x40) {
       UVC_DEBUG("bad packet: error bit set");
+      strmh->frame_had_errors = 1;
       return;
     }
 
@@ -766,13 +779,25 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
     strmh->fid = header_info & 1;
 
     if (header_info & (1 << 2)) {
-      strmh->pts = DW_TO_INT(payload + variable_offset);
+      /* guard the 4-byte read: some cameras set the flag but truncate the header */
+      if (variable_offset + 4 <= header_len) {
+        strmh->pts = DW_TO_INT(payload + variable_offset);
+      } else {
+        UVC_DEBUG("bogus packet: PTS flag set but header too short");
+        strmh->pts = 0;
+      }
       variable_offset += 4;
     }
 
     if (header_info & (1 << 3)) {
       /** @todo read the SOF token counter */
-      strmh->last_scr = DW_TO_INT(payload + variable_offset);
+      /* guard the 4-byte SCR read (the field is 6 bytes: 4 SCR + 2 SOF) */
+      if (variable_offset + 4 <= header_len) {
+        strmh->last_scr = DW_TO_INT(payload + variable_offset);
+      } else {
+        UVC_DEBUG("bogus packet: SCR flag set but header too short");
+        strmh->last_scr = 0;
+      }
       variable_offset += 6;
     }
 
@@ -828,6 +853,7 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
 
         if (pkt->status != 0) {
           UVC_DEBUG("bad packet (isochronous transfer); status: %d", pkt->status);
+          strmh->frame_had_errors = 1;
           continue;
         }
 
@@ -1441,12 +1467,37 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
   frame->sequence = strmh->hold_seq;
   frame->capture_time_finished = strmh->capture_time_finished;
 
-  /* copy the image data from the hold buffer to the frame (unnecessary extra buf?) */
-  if (frame->data_bytes < strmh->hold_bytes) {
-    frame->data = realloc(frame->data, strmh->hold_bytes);
+  /* copy the image data from the hold buffer to the frame (unnecessary extra buf?)
+   * Grow the buffer to hold at least what was received and, for uncompressed
+   * formats, zero-fill any shortfall below height*step so data_bytes never
+   * exceeds the allocation and the tail leaks no stale heap. For compressed /
+   * frame-based formats (H264/H265/MJPEG) step==0, so height*step==0 and this
+   * degenerates to the plain hold_bytes path -- the DJI zero-size tolerance is
+   * preserved and no zero-size realloc is forced. */
+  if (frame->data_bytes < strmh->hold_bytes ||
+      frame->data_bytes < frame->height * frame->step) {
+    if (strmh->hold_bytes >= frame->height * frame->step) {
+      frame->data = realloc(frame->data, strmh->hold_bytes);
+      if (frame->data == NULL) {
+        UVC_EXIT(UVC_ERROR_NO_MEM);
+        return;
+      }
+      frame->data_bytes = strmh->hold_bytes;
+    } else {
+      frame->data = realloc(frame->data, frame->height * frame->step);
+      if (frame->data == NULL) {
+        UVC_EXIT(UVC_ERROR_NO_MEM);
+        return;
+      }
+      memset(frame->data + strmh->hold_bytes, 0,
+             frame->height * frame->step - strmh->hold_bytes);
+      frame->data_bytes = frame->height * frame->step;
+    }
+  } else {
+    frame->data_bytes = strmh->hold_bytes;
   }
-  frame->data_bytes = strmh->hold_bytes;
-  memcpy(frame->data, strmh->holdbuf, frame->data_bytes);
+
+  memcpy(frame->data, strmh->holdbuf, strmh->hold_bytes);
 
   if (strmh->meta_hold_bytes > 0)
   {

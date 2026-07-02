@@ -287,6 +287,10 @@ struct uvc_stream_handle {
   /* raw metadata buffer if available */
   uint8_t *meta_outbuf, *meta_holdbuf;
   size_t meta_got_bytes, meta_hold_bytes;
+
+  /* set when a payload/packet of the in-progress frame reported an error;
+   * a flagged frame is suppressed in _uvc_swap_buffers and never delivered */
+  uint8_t frame_had_errors;
 };
 
 /** Handle on an open UVC device
