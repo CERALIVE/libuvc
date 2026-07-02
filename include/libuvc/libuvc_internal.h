@@ -239,6 +239,19 @@ typedef struct uvc_device_info {
 #endif
 #endif
 
+/* Bound uvc_stream_stop()'s wait for transfer cancellation so a wedged event
+ * thread (e.g. a dead/unplugged device that never completes the cancelled
+ * transfers) cannot hang the caller forever. Each iteration waits at most
+ * LIBUVC_STREAM_STOP_TIMEOUT_SECS; after LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS
+ * consecutive timeouts (~5s total) uvc_stream_stop returns UVC_ERROR_TIMEOUT.
+ */
+#ifndef LIBUVC_STREAM_STOP_TIMEOUT_SECS
+#define LIBUVC_STREAM_STOP_TIMEOUT_SECS 1
+#endif
+#ifndef LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS
+#define LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS 5
+#endif
+
 #define LIBUVC_XFER_META_BUF_SIZE ( 4 * 1024 )
 
 struct uvc_stream_handle {

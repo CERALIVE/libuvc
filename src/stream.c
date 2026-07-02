@@ -1563,6 +1563,9 @@ void uvc_stop_streaming(uvc_device_handle_t *devh) {
  */
 uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
   int i;
+  uvc_error_t ret = UVC_SUCCESS;
+  int timeout_attempts = 0;
+  struct timespec ts;
 
   if (!strmh->running)
     return UVC_ERROR_INVALID_PARAM;
@@ -1587,7 +1590,36 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
     }
     if(i == LIBUVC_NUM_TRANSFER_BUFS )
       break;
-    pthread_cond_wait(&strmh->cb_cond, &strmh->cb_mutex);
+
+    /* Bounded wait (mirrors uvc_stream_get_frame's timedwait): a dead device's
+     * cancelled transfers can fail to complete, so a plain pthread_cond_wait
+     * here hangs the caller forever. Wait at most LIBUVC_STREAM_STOP_TIMEOUT_SECS
+     * per iteration; give up after LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS timeouts.
+     * The stream is already marked stopped (running=0 above) so uvc_stream_close
+     * can proceed, and in-flight transfers are still left for _uvc_stream_callback
+     * to free (never freed here). */
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+
+#if _POSIX_TIMERS > 0
+    clock_gettime(CLOCK_REALTIME, &ts);
+#else
+    {
+      struct timeval tv;
+      gettimeofday(&tv, NULL);
+      ts.tv_sec = tv.tv_sec;
+      ts.tv_nsec = tv.tv_usec * 1000;
+    }
+#endif
+
+    ts.tv_sec += LIBUVC_STREAM_STOP_TIMEOUT_SECS;
+
+    if (pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts) == ETIMEDOUT) {
+      if (++timeout_attempts >= LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS) {
+        ret = UVC_ERROR_TIMEOUT;
+        break;
+      }
+    }
   } while(1);
   // Kick the user thread awake
   pthread_cond_broadcast(&strmh->cb_cond);
@@ -1601,7 +1633,7 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
     pthread_join(strmh->cb_thread, NULL);
   }
 
-  return UVC_SUCCESS;
+  return ret;
 }
 
 /** @brief Close stream.
