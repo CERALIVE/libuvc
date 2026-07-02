@@ -1493,7 +1493,57 @@ uvc_error_t uvc_parse_vs_format_mjpeg(uvc_streaming_interface_t *stream_if,
 }
 
 /** @internal
- * @brief Parse a VideoStreaming uncompressed frame block.
+ * @brief Repair degenerate VideoStreaming frame descriptor fields in place.
+ *
+ * Some devices (notably DJI action cameras streaming frame-based H.264/H.265)
+ * ship a bogus frame descriptor: a zero dwMaxVideoFrameBufferSize (the host
+ * uses it to size capture buffers) and/or a dwDefaultFrameInterval that is 0 or
+ * outside the advertised interval range. Only these degenerate values are
+ * touched, so a valid descriptor is left byte-identical.
+ *
+ * Adapted from saki4510t/UVCCamera 328d14d, guarded strictly on the degenerate
+ * cases (upstream rewrote dwMaxVideoFrameBufferSize unconditionally). The buffer
+ * size mirrors the zero-frame-size fixup in uvc_query_stream_ctrl: uncompressed
+ * formats have a real bBitsPerPixel; compressed formats (MJPEG, frame-based)
+ * report 0, so fall back to w*h*2.
+ */
+static void uvc_repair_frame_desc(uvc_format_desc_t *format,
+                                  uvc_frame_desc_t *frame) {
+  uint32_t min_interval, max_interval, repaired;
+
+  if (frame->dwMaxVideoFrameBufferSize == 0 && frame->wWidth && frame->wHeight) {
+    if (format->bBitsPerPixel)
+      frame->dwMaxVideoFrameBufferSize =
+        (uint32_t) format->bBitsPerPixel * frame->wWidth * frame->wHeight / 8;
+    else
+      frame->dwMaxVideoFrameBufferSize =
+        (uint32_t) frame->wWidth * frame->wHeight * 2;
+
+    UVC_DEBUG("repaired dwMaxVideoFrameBufferSize 0 -> %u for %ux%u frame",
+              frame->dwMaxVideoFrameBufferSize, frame->wWidth, frame->wHeight);
+  }
+
+  if (frame->bFrameIntervalType == 0) {
+    min_interval = frame->dwMinFrameInterval;
+    max_interval = frame->dwMaxFrameInterval;
+  } else {
+    min_interval = frame->intervals[0];
+    max_interval = frame->intervals[frame->bFrameIntervalType - 1];
+  }
+
+  if (min_interval && max_interval && min_interval <= max_interval &&
+      (frame->dwDefaultFrameInterval == 0 ||
+       frame->dwDefaultFrameInterval < min_interval ||
+       frame->dwDefaultFrameInterval > max_interval)) {
+    repaired = MIN(max_interval, MAX(min_interval, frame->dwDefaultFrameInterval));
+    UVC_DEBUG("repaired dwDefaultFrameInterval %u -> %u (range [%u, %u])",
+              frame->dwDefaultFrameInterval, repaired, min_interval, max_interval);
+    frame->dwDefaultFrameInterval = repaired;
+  }
+}
+
+/** @internal
+ * @brief Parse a VideoStreaming frame-based frame block.
  * @ingroup device
  */
 uvc_error_t uvc_parse_vs_frame_frame(uvc_streaming_interface_t *stream_if,
@@ -1528,15 +1578,19 @@ uvc_error_t uvc_parse_vs_frame_frame(uvc_streaming_interface_t *stream_if,
     frame->dwMaxFrameInterval = DW_TO_INT(&block[30]);
     frame->dwFrameIntervalStep = DW_TO_INT(&block[34]);
   } else {
+    uint32_t interval;
     frame->intervals = calloc(block[21] + 1, sizeof(frame->intervals[0]));
     p = &block[26];
 
     for (i = 0; i < block[21]; ++i) {
-      frame->intervals[i] = DW_TO_INT(p);
+      interval = DW_TO_INT(p);
+      frame->intervals[i] = interval ? interval : 1;
       p += 4;
     }
     frame->intervals[block[21]] = 0;
   }
+
+  uvc_repair_frame_desc(format, frame);
 
   DL_APPEND(format->frame_descs, frame);
 
@@ -1580,15 +1634,19 @@ uvc_error_t uvc_parse_vs_frame_uncompressed(uvc_streaming_interface_t *stream_if
     frame->dwMaxFrameInterval = DW_TO_INT(&block[30]);
     frame->dwFrameIntervalStep = DW_TO_INT(&block[34]);
   } else {
+    uint32_t interval;
     frame->intervals = calloc(block[25] + 1, sizeof(frame->intervals[0]));
     p = &block[26];
 
     for (i = 0; i < block[25]; ++i) {
-      frame->intervals[i] = DW_TO_INT(p);
+      interval = DW_TO_INT(p);
+      frame->intervals[i] = interval ? interval : 1;
       p += 4;
     }
     frame->intervals[block[25]] = 0;
   }
+
+  uvc_repair_frame_desc(format, frame);
 
   DL_APPEND(format->frame_descs, frame);
 

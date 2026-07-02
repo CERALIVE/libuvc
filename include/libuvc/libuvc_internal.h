@@ -29,6 +29,14 @@
   (p)[2] = (i) >> 16; \
   (p)[3] = (i) >> 24;
 
+/* Used by the degenerate frame-descriptor repair in device.c (saki4510t 328d14d). */
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
 /** Selects the nth item in a doubly linked list. n=-1 selects the last item. */
 #define DL_NTH(head, out, n) \
   do { \
