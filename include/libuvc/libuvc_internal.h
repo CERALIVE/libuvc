@@ -291,6 +291,11 @@ struct uvc_device_handle {
   /** Whether the camera is an iSight that sends one header per frame */
   uint8_t is_isight;
   uint32_t claimed;
+  /** Requested number of USB transfer buffers for the NEXT stream start.
+   * 0 = use the library default (LIBUVC_NUM_TRANSFER_BUFS). A non-zero value is
+   * clamped to [2, 100] by uvc_set_transfer_buffers() and latched at
+   * uvc_stream_start() time. */
+  uint8_t transfer_buffer_count;
 };
 
 /** Context within which we communicate with devices */

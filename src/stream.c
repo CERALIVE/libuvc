@@ -1068,6 +1068,43 @@ fail:
   return ret;
 }
 
+/** @brief Override the number of USB transfer buffers used for streaming.
+ * @ingroup streaming
+ *
+ * The chosen count is latched by the next uvc_start_streaming()/
+ * uvc_stream_start() on this device handle. More buffers absorb host-side
+ * scheduling jitter at the cost of RAM.
+ *
+ * @param devh  UVC device handle
+ * @param count Desired count. 0 restores the library default
+ *              (LIBUVC_NUM_TRANSFER_BUFS); any other value is clamped to [2, 100].
+ *
+ * @return UVC_SUCCESS on success; UVC_ERROR_INVALID_PARAM if @p devh is NULL;
+ *         UVC_ERROR_BUSY if a stream on @p devh is already running (the count is
+ *         consumed only at stream start and cannot change mid-stream).
+ */
+uvc_error_t uvc_set_transfer_buffers(uvc_device_handle_t *devh, uint8_t count) {
+  uvc_stream_handle_t *strmh;
+
+  if (devh == NULL)
+    return UVC_ERROR_INVALID_PARAM;
+
+  for (strmh = devh->streams; strmh != NULL; strmh = strmh->next) {
+    if (strmh->running)
+      return UVC_ERROR_BUSY;
+  }
+
+  if (count != 0) {
+    if (count < 2)
+      count = 2;
+    else if (count > 100)
+      count = 100;
+  }
+
+  devh->transfer_buffer_count = count;
+  return UVC_SUCCESS;
+}
+
 /** Begin streaming video from the stream into the callback function.
  * @ingroup streaming
  *
@@ -1094,6 +1131,7 @@ uvc_error_t uvc_stream_start(
   size_t total_transfer_size = 0;
   struct libusb_transfer *transfer;
   int transfer_id;
+  int num_transfer_bufs = LIBUVC_NUM_TRANSFER_BUFS;
 
   ctrl = &strmh->cur_ctrl;
 
@@ -1109,6 +1147,14 @@ uvc_error_t uvc_stream_start(
   strmh->fid = 0;
   strmh->pts = 0;
   strmh->last_scr = 0;
+
+  if (strmh->devh->transfer_buffer_count != 0) {
+    num_transfer_bufs = strmh->devh->transfer_buffer_count;
+    if (num_transfer_bufs < 2)
+      num_transfer_bufs = 2;
+    if (num_transfer_bufs > LIBUVC_NUM_TRANSFER_BUFS)
+      num_transfer_bufs = LIBUVC_NUM_TRANSFER_BUFS;
+  }
 
   frame_desc = uvc_find_frame_desc_stream(strmh, ctrl->bFormatIndex, ctrl->bFrameIndex);
   if (!frame_desc) {
@@ -1219,7 +1265,7 @@ uvc_error_t uvc_stream_start(
     }
 
     /* Set up the transfers */
-    for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; ++transfer_id) {
+    for (transfer_id = 0; transfer_id < num_transfer_bufs; ++transfer_id) {
       transfer = libusb_alloc_transfer(packets_per_transfer);
       strmh->transfers[transfer_id] = transfer;      
       strmh->transfer_bufs[transfer_id] = malloc(total_transfer_size);
@@ -1232,7 +1278,7 @@ uvc_error_t uvc_stream_start(
       libusb_set_iso_packet_lengths(transfer, endpoint_bytes_per_packet);
     }
   } else {
-    for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS;
+    for (transfer_id = 0; transfer_id < num_transfer_bufs;
         ++transfer_id) {
       transfer = libusb_alloc_transfer(0);
       strmh->transfers[transfer_id] = transfer;
@@ -1256,7 +1302,7 @@ uvc_error_t uvc_stream_start(
     pthread_create(&strmh->cb_thread, NULL, _uvc_user_caller, (void*) strmh);
   }
 
-  for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS;
+  for (transfer_id = 0; transfer_id < num_transfer_bufs;
       transfer_id++) {
     ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
     if (ret != UVC_SUCCESS) {
@@ -1265,13 +1311,23 @@ uvc_error_t uvc_stream_start(
     }
   }
 
-  if ( ret != UVC_SUCCESS && transfer_id >= 0 ) {
-    for ( ; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
+  if ( ret != UVC_SUCCESS && transfer_id > 0 ) {
+    for ( ; transfer_id < num_transfer_bufs; transfer_id++) {
       free ( strmh->transfers[transfer_id]->buffer );
       libusb_free_transfer ( strmh->transfers[transfer_id]);
       strmh->transfers[transfer_id] = 0;
     }
     ret = UVC_SUCCESS;
+  } else if ( ret != UVC_SUCCESS ) {
+    UVC_DEBUG("no transfers could be submitted; failing with UVC_ERROR_IO");
+    for (transfer_id = 0; transfer_id < num_transfer_bufs; transfer_id++) {
+      if (strmh->transfers[transfer_id]) {
+        free ( strmh->transfers[transfer_id]->buffer );
+        libusb_free_transfer ( strmh->transfers[transfer_id]);
+        strmh->transfers[transfer_id] = 0;
+      }
+    }
+    ret = UVC_ERROR_IO;
   }
 
   UVC_EXIT(ret);

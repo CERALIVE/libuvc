@@ -13,6 +13,34 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.3
+
+### Added
+
+- **Runtime-configurable USB transfer-buffer count.** New public API
+  `uvc_set_transfer_buffers(uvc_device_handle_t *devh, uint8_t count)`
+  (`include/libuvc/libuvc.h`, implemented in `src/stream.c`). The count is stored
+  on the device handle and latched by the next `uvc_start_streaming()` /
+  `uvc_stream_start()`, sizing the transfer allocation/submit loops. `count == 0`
+  (the default, unset state) preserves the prior byte-identical behavior of
+  allocating `LIBUVC_NUM_TRANSFER_BUFS` (100) buffers; a non-zero value is clamped
+  to `[2, 100]`. Setting the count while a stream on the handle is already running
+  is rejected with `UVC_ERROR_BUSY`. Adapted from upstream PR #291 (`7620d2f`,
+  `a100ee7`); the API is pinned device-handle-level rather than the PR's global
+  `uvc_stream_set_default_number_of_transport_buffers()` setter, and the static
+  transfer arrays are retained (only the loop bounds are made configurable). No
+  SONAME change; the existing `uvc_start_streaming()` signature is unchanged.
+
+### Fixed
+
+- **Fail loudly on zero submitted transfers.** `uvc_stream_start()` previously
+  treated `transfer_id >= 0` as success in its submit-failure path, so a device
+  that accepted *no* transfers reported success and then delivered no frames. The
+  test is now `transfer_id > 0`: when at least one transfer is submitted the
+  un-submitted remainder is freed and streaming continues with fewer buffers, but
+  when zero transfers are submitted the allocated transfers are freed and
+  `UVC_ERROR_IO` is returned. Matches upstream PR #291's fix.
+
 ## ceralive-v0.0.7.1
 
 ### Added
