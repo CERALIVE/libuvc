@@ -13,6 +13,77 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.7
+
+Security/correctness hotfix on top of `ceralive-v0.0.7.6`. Completes the
+quarantine philosophy established in rounds 1–3 — *once a context has been
+quarantined, never touch its handler thread's lifetime again* — by closing the
+one remaining `uvc_close()` path that still could. Off any healthy-device path:
+byte-identical behavior for currently-working devices.
+
+### Fixed
+
+- **Surviving event-handler thread wrongly killed by a later normal close on a
+  quarantined context** (fork commit — see tag `ceralive-v0.0.7.7`). The
+  `ceralive-v0.0.7.6` fix quarantines the **UVC context** (`has_quarantined_device`)
+  when `uvc_stream_stop()`'s bounded wait times out with libusb transfers still
+  outstanding, deliberately leaving the per-context `_uvc_handle_events()` thread
+  alive (joining a wedged dead device would reintroduce the unbounded hang the
+  bounded wait removed) and never clearing the flag (a leaked outstanding transfer
+  may still reference `ctx->usb_ctx`). But the **normal** (non-quarantine) path of
+  `uvc_close()` still had its original last-device branch —
+
+      if (ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL) {
+        ctx->kill_handler_thread = 1;
+        libusb_close(devh->usb_devh);
+        pthread_join(ctx->handler_thread, NULL);
+      }
+
+  — **not** gated on `!ctx->has_quarantined_device`. After a quarantine on device
+  A, a reconnect can reopen device B on the same context (round 3 correctly
+  suppresses a duplicate handler thread, since A's survivor already services the
+  whole libusb context). If B is then closed **normally** — e.g. negotiation or
+  stream-start failed before any streaming, so `uvc_stream_stop()` never timed out
+  for B and B carries no quarantined stream — `uvc_close(B)` sees B as the only /
+  last open device (`open_devices == B && B->next == NULL`) and TRUE-branched into
+  `kill_handler_thread = 1` + `pthread_join()`, **killing the surviving handler
+  thread round 3 deliberately kept alive**. Because `has_quarantined_device` is
+  never cleared, `uvc_open_internal()`'s spawn guard (`&& !has_quarantined_device`)
+  then never starts a replacement thread on that context — so every subsequent
+  transfer submitted on it never completes, silently breaking all future event
+  servicing for the remaining lifetime of the context, with no error surfaced.
+
+  This is reachable from the plugin's real reconnect path: `gst_libuvc_h264_src_
+  reconnect()` reuses the element's `uvc_context` across retries, and a reopen
+  after a quarantine event that fails negotiation or stream-start calls
+  `uvc_close()` on exactly the only-open-device it just opened.
+
+  The fix adds `&& !ctx->has_quarantined_device` to that last-device condition, so
+  once a context has been quarantined `uvc_close()` never again sets
+  `kill_handler_thread` or joins `ctx->handler_thread`; it takes the `else` branch,
+  which still `libusb_close()`s the closing device's **own** USB handle (B's
+  resources — USB handle, device ref, parsed info — are fully released as before)
+  while sparing only the **shared** surviving handler thread. On a context that was
+  never quarantined the branch is byte-identical to before: the last normal close
+  still kills and joins the thread, and `uvc_exit()` still `libusb_exit()`s and
+  `free()`s the context (no leak). This is the last `kill_handler_thread` /
+  `pthread_join(ctx->handler_thread)` site in the library; every other reference to
+  the handler thread is either the thread body reading the flag (`init.c:89`) or a
+  spawn already gated on `!has_quarantined_device` (`device.c` call site) — so no
+  ungated path to killing the shared thread remains. The bounded-wait guarantee is
+  preserved (no new join of a possibly-wedged thread is introduced).
+
+  Verified with the round-3 fork-level ASan/LSan harness extended with a new
+  scenario (T7): quarantine device A on a context; reopen device B on the same
+  context (asserting no duplicate handler thread, per round 3); close B **normally**
+  (bounded, no timeout); assert the handler thread is still alive and still
+  servicing events (`kill_handler_thread == 0`, a live-thread event-loop probe keeps
+  advancing, and a third reopened device C still finds exactly one handler thread).
+  A revert-check against `ceralive-v0.0.7.6` reproduces the defect in the same
+  scenario — `kill_handler_thread == 1` after the normal close and the event-loop
+  probe freezes (the surviving thread joined/killed) — proving the test is
+  non-vacuous. Both builds are LSan-clean on the unaffected paths (T4/T5/T6).
+
 ## ceralive-v0.0.7.6
 
 Security/correctness hotfix on top of `ceralive-v0.0.7.5`. Extends the round-1

@@ -1869,8 +1869,27 @@ void uvc_close(uvc_device_handle_t *devh) {
   /* If we are managing the libusb context and this is the last open device,
    * then we need to cancel the handler thread. When we call libusb_close,
    * it'll cause a return from the thread's libusb_handle_events call, after
-   * which the handler thread will check the flag we set and then exit. */
-  if (ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL) {
+   * which the handler thread will check the flag we set and then exit.
+   *
+   * context-lifetime hotfix (round 4): but NOT if this context has ever
+   * quarantined a device. Once has_quarantined_device is set, an earlier
+   * uvc_close() intentionally kept the event handler thread alive (killing/
+   * joining a wedged dead device would reintroduce the unbounded hang the
+   * bounded stop wait removed) and left the flag set forever (a leaked
+   * outstanding transfer may still reference ctx->usb_ctx). A later NORMAL
+   * close of another device reopened on this same context (e.g. a reconnect
+   * whose negotiation or stream-start failed before any streaming, so this
+   * handle never quarantined) would otherwise TRUE-branch here -- it is the
+   * only/last open device -- and kill+join that surviving handler thread. That
+   * both risks joining a possibly-wedged thread and, worse, leaves
+   * has_quarantined_device == 1 with the thread dead: uvc_open_internal()'s
+   * spawn guard (also gated on !has_quarantined_device) then never starts a
+   * replacement, silently killing all future event servicing on the context.
+   * So once quarantined, uvc_close() must never again touch the shared handler
+   * thread's lifetime -- take the else branch, releasing only THIS device's own
+   * USB handle. */
+  if (ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL
+      && !ctx->has_quarantined_device) {
     ctx->kill_handler_thread = 1;
     libusb_close(devh->usb_devh);
     pthread_join(ctx->handler_thread, NULL);
