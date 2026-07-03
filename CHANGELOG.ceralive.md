@@ -13,6 +13,47 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.4
+
+Security/correctness hotfix on top of `ceralive-v0.0.7.3`. One targeted fix in
+`src/stream.c`, off any healthy-device path — byte-identical streaming behavior
+for currently-working devices. Fixes a use-after-free introduced by the
+interaction of the `ceralive-v0.0.7.3` bounded stream-stop (A5, `ab49e21`) with
+`uvc_stream_close()`'s unconditional teardown.
+
+### Fixed
+
+- **Use-after-free in `uvc_stream_close()` on the A5 stop-timeout path**
+  (fork commit — see tag `ceralive-v0.0.7.4`). A5 made `uvc_stream_stop()` return
+  `UVC_ERROR_TIMEOUT` after a bounded wait instead of hanging when a
+  dead/unplugged device's cancelled transfers never complete (a wedged libusb
+  event thread). On that timeout the `strmh->transfers[i]` slots stay non-NULL
+  and libusb still holds the handle via each pending transfer's `user_data`.
+  `uvc_stream_close()` discarded the stop result and unconditionally freed
+  `strmh`, destroyed its `cb_mutex`/`cb_cond`, and freed its buffers — so a late
+  `_uvc_stream_callback()` firing for a still-live transfer dereferenced freed
+  memory and locked a destroyed mutex (a use-after-free of the same severity
+  class as CVE-2026-1991).
+
+  `uvc_stream_close()` now scans the transfer slots under `cb_mutex` after
+  `uvc_stream_stop()` returns. The handle is unconditionally unlinked from
+  `devh->streams` (safe: `_uvc_stream_callback()` reaches the handle only via
+  `transfer->user_data`, never by walking the list, and unlinking keeps
+  `uvc_close()`'s `uvc_stop_streaming()` sweep from re-visiting it). If any
+  transfer slot is still non-NULL, the handle is **quarantined** — intentionally
+  leaked, with its mutex/cond/buffers left valid — so a late completion lands on
+  live memory instead of freed memory; otherwise the original full free/destroy
+  sequence runs unchanged. The quarantine is a small, rare, bounded leak that
+  occurs only on a genuinely dead device whose cancelled transfers never
+  completed; the common fast-cancel path still fully frees the handle (no leak).
+  A5's bounded-wait guarantee (never hang forever on a dead device) is preserved.
+
+  Verified with a fork-level ASan/LSan harness driving `uvc_stream_close()` on a
+  stuck stream (never-completing cancel): close returns within A5's ~5 s bound,
+  a late `_uvc_stream_callback()` fired afterward is ASan-clean, the fast-cancel
+  path is LSan-clean, and a revert-check against the pre-fix code reproduces the
+  use-after-free inside `_uvc_stream_callback()` (non-vacuous).
+
 ## ceralive-v0.0.7.3
 
 Hardening release. Audited, individually-verified backports from upstream

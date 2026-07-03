@@ -1697,8 +1697,51 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
  * @param strmh UVC stream handle
  */
 void uvc_stream_close(uvc_stream_handle_t *strmh) {
+  int i;
+  int transfers_pending = 0;
+
   if (strmh->running)
     uvc_stream_stop(strmh);
+
+  /* A5's bounded wait in uvc_stream_stop() can return while a cancelled transfer
+   * never completed (a dead/unplugged device whose event thread is wedged): the
+   * transfer slot stays non-NULL and libusb still holds this handle via the
+   * pending transfer's user_data. Freeing strmh here would then let a late
+   * _uvc_stream_callback() dereference freed memory, lock a destroyed cb_mutex,
+   * broadcast a destroyed cb_cond and write into a freed transfers[] / buffers --
+   * a use-after-free in the exact dead-device path A5 is meant to survive. Scan
+   * the transfer slots under cb_mutex (so the check races cleanly with the
+   * callback's own writes to those slots) to decide whether any late callback can
+   * still reference this handle. */
+  pthread_mutex_lock(&strmh->cb_mutex);
+  for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+    if (strmh->transfers[i] != NULL) {
+      transfers_pending = 1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&strmh->cb_mutex);
+
+  /* Unlink from the device's stream list in either case: _uvc_stream_callback()
+   * reaches this handle only through transfer->user_data, never by walking
+   * devh->streams, so removing the node is safe even while a late callback may
+   * still fire -- and it keeps uvc_close()'s teardown (which re-runs
+   * uvc_stop_streaming() over devh->streams) from re-visiting a quarantined
+   * handle. */
+  DL_DELETE(strmh->devh->streams, strmh);
+
+  if (transfers_pending) {
+    /* Quarantine instead of free: intentionally leak this handle rather than
+     * risk the use-after-free above. This is a small, rare, bounded leak that
+     * happens only on a genuinely dead device whose cancelled transfers never
+     * completed; the alternative -- freeing memory libusb still references -- is
+     * a security-class UAF. The leaked handle's mutex, cond and buffers stay
+     * valid so a late completion lands on live memory. */
+    UVC_DEBUG("stream stop timed out with transfers still in flight; "
+              "quarantining stream handle %p (intentional bounded leak) to avoid "
+              "a use-after-free on a late transfer completion", (void *) strmh);
+    return;
+  }
 
   uvc_release_if(strmh->devh, strmh->stream_if->bInterfaceNumber);
 
@@ -1717,6 +1760,5 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
   pthread_cond_destroy(&strmh->cb_cond);
   pthread_mutex_destroy(&strmh->cb_mutex);
 
-  DL_DELETE(strmh->devh->streams, strmh);
   free(strmh);
 }
