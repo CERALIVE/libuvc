@@ -15,9 +15,19 @@ the upstream history, see `changelog.txt`.
 
 ## ceralive-v0.0.7.3
 
+Hardening release. Audited, individually-verified backports from upstream
+`libuvc` PRs and the `pupil-labs` / `saki4510t` forks, each landed as a single,
+fork-style-adapted commit on `hardening/v0.0.7.3` (branched from `eae7f49`, tag
+`ceralive-v0.0.7.2`). Every change is either off-by-default or a pure robustness
+guard — no negotiated default changes and byte-identical streaming behavior for
+currently-working devices. Each entry cites its **fork-commit SHA** and upstream
+provenance. Backlog IDs (A1–A14) refer to the equivalence audit in the plugin
+repo's `.omo/evidence/task-1-uvc-camera-compat-stability.md`.
+
 ### Added
 
-- **Runtime-configurable USB transfer-buffer count.** New public API
+- **Runtime-configurable USB transfer-buffer count** (A2 — fork `001e8d3`;
+  upstream PR #291 `7620d2f`, `a100ee7`). New public API
   `uvc_set_transfer_buffers(uvc_device_handle_t *devh, uint8_t count)`
   (`include/libuvc/libuvc.h`, implemented in `src/stream.c`). The count is stored
   on the device handle and latched by the next `uvc_start_streaming()` /
@@ -25,21 +35,109 @@ the upstream history, see `changelog.txt`.
   (the default, unset state) preserves the prior byte-identical behavior of
   allocating `LIBUVC_NUM_TRANSFER_BUFS` (100) buffers; a non-zero value is clamped
   to `[2, 100]`. Setting the count while a stream on the handle is already running
-  is rejected with `UVC_ERROR_BUSY`. Adapted from upstream PR #291 (`7620d2f`,
-  `a100ee7`); the API is pinned device-handle-level rather than the PR's global
-  `uvc_stream_set_default_number_of_transport_buffers()` setter, and the static
-  transfer arrays are retained (only the loop bounds are made configurable). No
-  SONAME change; the existing `uvc_start_streaming()` signature is unchanged.
+  is rejected with `UVC_ERROR_BUSY`. The API is pinned device-handle-level rather
+  than the PR's global `uvc_stream_set_default_number_of_transport_buffers()`
+  setter, and the static transfer arrays are retained (only the loop bounds are
+  made configurable). No SONAME change; the existing `uvc_start_streaming()`
+  signature is unchanged.
 
 ### Fixed
 
-- **Fail loudly on zero submitted transfers.** `uvc_stream_start()` previously
-  treated `transfer_id >= 0` as success in its submit-failure path, so a device
-  that accepted *no* transfers reported success and then delivered no frames. The
-  test is now `transfer_id > 0`: when at least one transfer is submitted the
-  un-submitted remainder is freed and streaming continues with fewer buffers, but
-  when zero transfers are submitted the allocated transfers are freed and
-  `UVC_ERROR_IO` is returned. Matches upstream PR #291's fix.
+- **Retry USB alt-setting once on transient failure** (A1 — fork `3195bbc`;
+  upstream PR #293 `212b85d`). `uvc_stream_start()` now retries
+  `libusb_set_interface_alt_setting()` (bounded loop, UVC_DEBUG-logged) before
+  failing, so a stream start that loses a single alt-setting negotiation to a
+  transient USB error recovers instead of aborting. A persistently failing call
+  still propagates the original libusb error via the pre-existing `goto fail`.
+
+- **Free frame-metadata buffer in `uvc_stream_close()`** (A3 — fork `3195bbc`;
+  upstream PR #295 `ca65b0b`). The per-frame metadata buffer
+  (`strmh->frame.metadata` / `meta_outbuf`) was never freed on stream teardown,
+  leaking on every open→start→stop→close cycle. It is now freed alongside
+  `frame.data` in a guarded-free block. (Upstream PR #275 is the identical
+  duplicate; PR #295 was picked per the audit.)
+
+- **Fail loudly on zero submitted transfers** (A2 — fork `001e8d3`; upstream
+  PR #291). `uvc_stream_start()` previously treated `transfer_id >= 0` as success
+  in its submit-failure path, so a device that accepted *no* transfers reported
+  success and then delivered no frames. The test is now `transfer_id > 0`: when at
+  least one transfer is submitted the un-submitted remainder is freed and
+  streaming continues with fewer buffers, but when zero transfers are submitted
+  the allocated transfers are freed and `UVC_ERROR_IO` is returned.
+
+- **Repair degenerate frame descriptors** (A4 — fork `5df5401`; saki4510t
+  `328d14d`). During frame-descriptor parsing in `src/device.c`, a
+  `dwMaxVideoFrameBufferSize == 0` (seen on some DJI action cameras) is now
+  repaired to a sane fallback, and a `dwDefaultFrameInterval` that is zero or
+  outside `[dwMinFrameInterval, dwMaxFrameInterval]` is clamped into range;
+  UVC_DEBUG-logged. The guard is strict on the degenerate cases only —
+  already-sane descriptors are left byte-identical.
+
+- **Bounded wait in `uvc_stream_stop()`; no more indefinite teardown hang**
+  (A5 — fork `ab49e21`; pupil-labs `c534e3d`, upstream PR #59 / issue #152). The
+  indefinite `pthread_cond_wait` on transfer cancellation is replaced with a
+  bounded `pthread_cond_timedwait` (~1 s per iteration, ~5 s cap) that returns
+  `UVC_ERROR_TIMEOUT` if cancellations never complete, while still marking the
+  stream stopped so `uvc_stream_close()` can proceed. Transfers still in flight
+  are not freed (the d3318ae invariant is preserved); the fast-cancel path is
+  unchanged.
+
+- **Zero `GET_MAX` payload fallback** (A7 — fork `69c7da8`; upstream PR #277,
+  issue #276). When a device's `GET_MAX` returns
+  `dwMaxPayloadTransferSize == 0` during stream negotiation, the negotiated
+  control now falls back to the `GET_CUR`/descriptor value instead of propagating
+  a zero payload size. Composes with the existing `f4af02a` smaller-max-payload
+  handling with no double-handling.
+
+- **Corrupt / oversized payload guards** (A9, subsumes A8 — fork `69c7da8`;
+  upstream PR #184 + PR #212 + saki4510t `9e95b8a`). One coherent superset patch
+  in the payload/frame path: (1) bounds-check PTS/SCR reads in
+  `_uvc_process_payload` before dereferencing (`variable_offset + 4 <= header_len`,
+  else zero); (2) grow/realloc guard in `_uvc_populate_frame` to
+  `max(hold_bytes, height*step)` with an explicit `return` on allocation failure
+  (the fork's `UVC_EXIT` is a no-op in non-debug builds), zero-filling any short
+  tail and copying only `hold_bytes` — the DJI/compressed `step == 0` zero-size
+  tolerance from A4 is preserved; (3) a `frame_had_errors` flag on
+  `struct uvc_stream_handle` set on the payload error bit and on non-zero packet
+  status, suppressing delivery of the whole corrupt frame to the callback. The
+  three already-present guards (overflow clamp, per-payload error-bit skip,
+  per-packet status skip) were kept, not duplicated.
+
+- **Preserve VC-header `dwClockFrequency`** (A12 — fork `9874f4c`; pupil-labs
+  `92d2f82`, `74e7a96`). `uvc_parse_vc_header()` now reads `dwClockFrequency`
+  into the control-interface info for the `0x0110` and `0x0150` bcdUVC cases
+  (previously left zeroed), and `uvc_query_stream_ctrl()` stops zeroing it during
+  stream-control parsing. Plumbing only — the clock is not surfaced onto frames
+  and there is no PTS behavior change (see the plugin's `scr-investigation.md`).
+
+### Not backported (audit-confirmed already-equivalent)
+
+The following backlog items were evaluated and deliberately **not** landed —
+each is already covered by the fork's current state or is out of the fork's
+scope. Verdicts are from the todo-1 equivalence audit, independently
+re-verified against the branch HEAD.
+
+- **A6 — Composite-device control interface routing** (pupil-labs `9004351`):
+  the fork already routes unit control requests to the parsed VideoControl
+  interface number (`info->ctrl_if.bInterfaceNumber`, set from the interface
+  scan, not hard-coded to 0). The fork base is already at pupil-labs's
+  post-fix state; re-picking would be a no-op.
+- **A10 — `get_device_descriptor` robustness** (upstream `e001f04`): already
+  present as commit `eae7f49` (its message records "+ backport e001f04"); the
+  `uvc_scan_control` TIS-detection guard is byte-for-byte equivalent.
+- **A11 — Detach only an active kernel driver** (upstream PR #224): covered by
+  fork commit `2f32812`, which sets `libusb_set_auto_detach_kernel_driver(…, 1)`
+  (libusb detaches only when a driver is actually active) and by
+  `uvc_claim_if()` already tolerating the no-active-driver error codes.
+- **A13 — `libusb_device` refcount leak** (saki4510t `2596242`): the
+  libuvc-portion hunk is comment-only for `uvc_ref_device`/`uvc_unref_device`
+  (already correct in the fork) and otherwise touches only the Android-JNI
+  `uvc_get_device_with_fd`, which does not exist in this fork. The real leak fix
+  lives in Android libusb, out of scope. A 1000× enumerate/free loop is
+  ASan/LSan-clean, confirming no pre-existing leak.
+- **A14 — Double-probe workaround** (upstream issue #242): implemented in the
+  plugin (`gstlibuvch264src`) as an opt-in `QUIRK_DOUBLE_PROBE` vid:pid quirk
+  seam that ships with an empty table — not a libuvc fork change.
 
 ## ceralive-v0.0.7.1
 
