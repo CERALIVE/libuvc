@@ -13,6 +13,67 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.8
+
+Security/correctness hotfix on top of `ceralive-v0.0.7.7`. Fixes a
+use-after-free in `uvc_exit()`'s iteration over `ctx->open_devices`. Unlike
+rounds 1–4 (which are specific to the stop-timeout quarantine feature), this is
+a **pre-existing, general fork/upstream defect** — it reproduces on any context
+with two or more devices open, with or without a quarantine — that was surfaced
+by the round-3/round-4 review of this exact function. Off any single-device or
+already-closed path: no behavior change.
+
+### Fixed
+
+- **Use-after-free iterating `ctx->open_devices` in `uvc_exit()`** (fork commit —
+  see tag `ceralive-v0.0.7.8`). `uvc_exit()` walked the open-device list with a
+  plain `DL_FOREACH`:
+
+      DL_FOREACH(ctx->open_devices, devh) {
+        uvc_close(devh);
+      }
+
+  `DL_FOREACH(head, el)` expands to `for(el=head; el; el=el->next)` — it reads
+  `el->next` in the loop's **increment step, which runs after the body**.
+  `uvc_close()`, on its NORMAL (non-quarantine) path, `DL_DELETE`s `devh` from
+  `ctx->open_devices` and then `uvc_free_devh(devh)`s it. So once the body has
+  freed the current node, the next iteration's `el->next` read dereferences freed
+  memory — a genuine use-after-free, reproducible whenever `uvc_exit()` runs with
+  two or more devices open on the same context. It also interacts with the
+  quarantine feature: a context carrying one quarantined device (already unlinked
+  and intentionally leaked) plus one other live, normally-open device hits exactly
+  this UAF when the live device's normal close frees it and the loop then reads
+  its `next`.
+
+  The fix mirrors `uvc_stop_streaming()`'s existing `DL_FOREACH_SAFE` over
+  `devh->streams` (where `uvc_stream_close()` frees `strmh` the same way):
+
+      uvc_device_handle_t *devh, *devh_tmp;
+
+      DL_FOREACH_SAFE(ctx->open_devices, devh, devh_tmp) {
+        uvc_close(devh);
+      }
+
+  `DL_FOREACH_SAFE(head, el, tmp)` caches `el->next` in `tmp` **before** the body
+  runs, so freeing `el` in the body is safe. Only the iteration macro changed; the
+  round-3 quarantine guard (`if (ctx->has_quarantined_device) { …; return; }`)
+  after the loop is unchanged in position and logic. An exhaustive sweep of every
+  remaining `DL_FOREACH(` (non-`_SAFE`) call site in `src/*.c` confirmed this was
+  the only one whose loop body frees or deletes the current element; the rest
+  (`uvc_already_open`, `uvc_num_devices`, the diagnostic and descriptor-inventory
+  walks) are read-only iterations that never mutate the list they traverse.
+
+  Verified with the round-3/round-4 fork-level ASan/LSan harness extended with two
+  scenarios: **T8** — quarantine device A (stop-timeout, so A is unlinked and the
+  handler thread kept alive), reopen device B normally on the same context, then
+  `uvc_exit()`; and **T9** — the fully-normal case, two devices open with no
+  quarantine at all, then `uvc_exit()`. Both are clean on the fixed build (T9 is
+  LSan-clean: both devices and the context are freed). A revert-check against
+  `ceralive-v0.0.7.7` reproduces a `heap-use-after-free` at `init.c` in `uvc_exit`
+  (freed by `uvc_free_devh`) in **both** scenarios — proving the tests are
+  non-vacuous and that the defect is not quarantine-specific. T4–T7 pass
+  identically on both trees, confirming the fix is surgical.
+
 ## ceralive-v0.0.7.7
 
 Security/correctness hotfix on top of `ceralive-v0.0.7.6`. Completes the

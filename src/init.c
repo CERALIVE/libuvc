@@ -136,9 +136,19 @@ uvc_error_t uvc_init(uvc_context_t **pctx, struct libusb_context *usb_ctx) {
  * @param ctx UVC context to shut down
  */
 void uvc_exit(uvc_context_t *ctx) {
-  uvc_device_handle_t *devh;
+  uvc_device_handle_t *devh, *devh_tmp;
 
-  DL_FOREACH(ctx->open_devices, devh) {
+  /* lifetime hotfix (round 5): uvc_close(devh), on its NORMAL (non-quarantine)
+   * path, DL_DELETEs devh from ctx->open_devices and then uvc_free_devh(devh)s
+   * it. A plain DL_FOREACH reads el->next in its increment step AFTER the body
+   * runs, so once uvc_close() has freed the current node the next iteration
+   * dereferences freed memory -- a use-after-free reproducible whenever two or
+   * more devices are open on the same context (e.g. one quarantined handle plus
+   * one live normally-open device). Iterate with DL_FOREACH_SAFE, which caches
+   * next in devh_tmp BEFORE the body runs, mirroring uvc_stop_streaming()'s
+   * DL_FOREACH_SAFE over devh->streams (uvc_stream_close() frees strmh the same
+   * way). */
+  DL_FOREACH_SAFE(ctx->open_devices, devh, devh_tmp) {
     uvc_close(devh);
   }
 
