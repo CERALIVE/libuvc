@@ -1817,6 +1817,36 @@ void uvc_close(uvc_device_handle_t *devh) {
   if (devh->streams)
     uvc_stop_streaming(devh);
 
+  /* devh-lifetime hotfix (round 2): if uvc_stop_streaming() -> uvc_stream_close()
+   * had to quarantine any of this device's streams (a dead/unplugged device
+   * whose cancelled transfers never completed within uvc_stream_stop()'s bounded
+   * wait, so libusb still owns a pending transfer whose user_data -> strmh, with
+   * strmh->devh -> THIS handle), a late _uvc_stream_callback() delivering
+   * LIBUSB_TRANSFER_COMPLETED re-enters _uvc_process_payload() and reads
+   * strmh->devh->is_isight before it checks strmh->running. Freeing devh here
+   * (uvc_free_devh) would make that a use-after-free: the round-1 quarantine
+   * keeps strmh alive but not the separate uvc_device_handle it points into.
+   * Mirror the same "safety over leak" tradeoff -- intentionally leak devh and
+   * everything it owns (the USB handle, the libusb device ref, the parsed device
+   * info) rather than free memory a late callback can still touch. Skipping
+   * libusb_close() additionally avoids closing a USB handle with a transfer still
+   * outstanding and avoids joining a possibly-wedged event-handler thread, which
+   * would reintroduce the very unbounded hang uvc_stream_stop()'s bounded wait
+   * removed. Unlink devh from ctx->open_devices first: a late callback reaches
+   * devh only via transfer->user_data -> strmh -> devh, never by walking
+   * open_devices, so the unlink is safe and keeps uvc_exit()/a later uvc_close()
+   * from re-visiting (double-freeing, or mis-detecting the "last device") this
+   * quarantined handle. */
+  if (devh->has_quarantined_stream) {
+    UVC_DEBUG("device handle %p has a quarantined stream (stream stop timed out "
+              "with transfers still in flight); quarantining the device handle "
+              "(intentional bounded leak) to avoid a use-after-free on a late "
+              "transfer completion that dereferences devh", (void *) devh);
+    DL_DELETE(ctx->open_devices, devh);
+    UVC_EXIT_VOID();
+    return;
+  }
+
   uvc_release_if(devh, devh->info->ctrl_if.bInterfaceNumber);
 
   /* If we are managing the libusb context and this is the last open device,

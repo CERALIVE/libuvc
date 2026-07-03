@@ -1736,7 +1736,17 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
      * happens only on a genuinely dead device whose cancelled transfers never
      * completed; the alternative -- freeing memory libusb still references -- is
      * a security-class UAF. The leaked handle's mutex, cond and buffers stay
-     * valid so a late completion lands on live memory. */
+     * valid so a late completion lands on live memory.
+     *
+     * Keeping strmh alive is necessary but NOT sufficient. A late completion can
+     * arrive as LIBUSB_TRANSFER_COMPLETED (real data still lands after
+     * libusb_cancel_transfer -- cancellation is asynchronous), which re-enters
+     * _uvc_process_payload() and dereferences strmh->devh->is_isight BEFORE it
+     * checks strmh->running. strmh->devh is a SEPARATE object (uvc_device_handle)
+     * that uvc_close() would still free via uvc_free_devh(). Flag the device
+     * handle so uvc_close() quarantines it too and that late deref lands on live
+     * memory. */
+    strmh->devh->has_quarantined_stream = 1;
     UVC_DEBUG("stream stop timed out with transfers still in flight; "
               "quarantining stream handle %p (intentional bounded leak) to avoid "
               "a use-after-free on a late transfer completion", (void *) strmh);

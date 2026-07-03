@@ -13,6 +13,58 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.5
+
+Security/correctness hotfix on top of `ceralive-v0.0.7.4`. Extends the round-1
+stream-handle quarantine to the **device handle**, off any healthy-device path —
+byte-identical streaming behavior for currently-working devices. Fixes a second,
+deeper use-after-free that the round-1 fix did not cover.
+
+### Fixed
+
+- **Use-after-free of the device handle on the stop-timeout / late-completion
+  path** (fork commit — see tag `ceralive-v0.0.7.5`). The `ceralive-v0.0.7.4`
+  fix quarantines (intentionally leaks) the *stream* handle `strmh` when
+  `uvc_stream_stop()`'s bounded wait times out with libusb transfers still
+  outstanding, so a late `_uvc_stream_callback()` lands on live memory. But
+  `strmh->devh` — the `uvc_device_handle_t` — is a **separate** object, and
+  `uvc_close()` still freed it via `uvc_free_devh()` after `uvc_stop_streaming()`
+  returned, regardless of any quarantined stream. A late completion that arrives
+  as `LIBUSB_TRANSFER_COMPLETED` (real data can still land after
+  `libusb_cancel_transfer()` — cancellation is asynchronous) re-enters
+  `_uvc_process_payload()`, which dereferences `strmh->devh->is_isight`
+  (`stream.c:740`/`:754`) **before** it checks `strmh->running`. Freeing `devh`
+  in `uvc_close()` therefore left that dereference reading freed memory — a
+  use-after-free of the same severity class as the round-1 defect and
+  CVE-2026-1991.
+
+  `uvc_stream_close()` now sets a `has_quarantined_stream` flag on `strmh->devh`
+  whenever it quarantines a stream. `uvc_close()`, after `uvc_stop_streaming()`
+  returns, checks that flag: if set, it **quarantines the device handle too** —
+  intentionally leaking `devh` and everything it owns (the USB handle, the libusb
+  device reference, the parsed device info) instead of running
+  `uvc_release_if()` / `libusb_close()` / `uvc_unref_device()` /
+  `uvc_free_devh()`. The handle is still unlinked from `ctx->open_devices` first
+  (safe: a late callback reaches `devh` only via `transfer->user_data -> strmh ->
+  devh`, never by walking `open_devices`; the unlink keeps `uvc_exit()` / a later
+  `uvc_close()` from re-visiting or double-freeing the quarantined handle).
+  Skipping `libusb_close()` also avoids closing a USB handle with a transfer
+  still outstanding and avoids joining a possibly-wedged event-handler thread —
+  preserving the bounded-wait guarantee (never hang forever on a dead device).
+  The common fast-cancel path still fully frees **both** `strmh` and `devh` (no
+  leak). The quarantine is a small, rare, bounded leak that occurs only on a
+  genuinely dead device whose cancelled transfers never completed.
+
+  Verified with a fork-level ASan/LSan harness driving the real `uvc_close()` on
+  a stuck-stream device: the round-1 stream quarantine still holds (bounded, late
+  `CANCELLED` callback ASan-clean); the normal path fully frees both handles
+  (LSan-clean); `uvc_close()` on a stuck-stream device does **not** free `devh`
+  and a late `LIBUSB_TRANSFER_COMPLETED` callback dereferencing
+  `strmh->devh->is_isight` afterward is ASan-clean; and a revert-check against
+  the round-1-only code (`ceralive-v0.0.7.4`) reproduces the use-after-free at
+  `_uvc_process_payload()` (`stream.c:740`), freed by `uvc_free_devh()`
+  (non-vacuous — round 1 alone is insufficient).
+
 ## ceralive-v0.0.7.4
 
 Security/correctness hotfix on top of `ceralive-v0.0.7.3`. One targeted fix in

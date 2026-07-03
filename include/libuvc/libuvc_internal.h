@@ -321,6 +321,16 @@ struct uvc_device_handle {
    * clamped to [2, 100] by uvc_set_transfer_buffers() and latched at
    * uvc_stream_start() time. */
   uint8_t transfer_buffer_count;
+  /** Set once uvc_stream_close() had to QUARANTINE (intentionally leak) one of
+   * this device's streams because uvc_stream_stop()'s bounded wait timed out
+   * with libusb transfers still outstanding (a dead/unplugged device whose
+   * cancelled transfers never completed). A late _uvc_stream_callback() for such
+   * a transfer re-enters _uvc_process_payload(), which dereferences
+   * strmh->devh->is_isight -- i.e. THIS handle -- before it checks
+   * strmh->running. So while this flag is set uvc_close() must NOT free the
+   * handle (uvc_free_devh) or tear down anything it owns; it quarantines the
+   * device handle too, mirroring the stream-handle leak. Never cleared. */
+  uint8_t has_quarantined_stream;
 };
 
 /** Context within which we communicate with devices */
