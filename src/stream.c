@@ -262,15 +262,17 @@ uvc_error_t uvc_query_stream_ctrl(
     ctrl->dwMaxPayloadTransferSize = DW_TO_INT(buf + 22);
 
     if (len == 34) {
-      ctrl->dwClockFrequency = DW_TO_INT ( buf + 26 );
       ctrl->bmFramingInfo = buf[30];
       ctrl->bPreferredVersion = buf[31];
       ctrl->bMinVersion = buf[32];
       ctrl->bMaxVersion = buf[33];
       /** @todo support UVC 1.1 */
     }
-    else
-      ctrl->dwClockFrequency = devh->info->ctrl_if.dwClockFrequency;
+
+    /* Always use the VC-header dwClockFrequency, not the buf+26 probe response:
+     * a zero there must not erase the enumerated value (pupil-labs 92d2f82). */
+    ctrl->dwClockFrequency = devh->info->ctrl_if.dwClockFrequency;
+    UVC_DEBUG("ctrl->dwClockFrequency = %d", ctrl->dwClockFrequency);
 
     /* fix up block for cameras that fail to set dwMax* */
     if (ctrl->dwMaxVideoFrameSize == 0) {
