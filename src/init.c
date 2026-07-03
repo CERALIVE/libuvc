@@ -142,6 +142,22 @@ void uvc_exit(uvc_context_t *ctx) {
     uvc_close(devh);
   }
 
+  /* context-lifetime hotfix (round 3): a quarantined uvc_close() (a dead device
+   * whose cancelled transfers never completed within the bounded stop wait)
+   * returns without killing/joining the event handler thread, so
+   * _uvc_handle_events() may still be looping on ctx->usb_ctx. Tearing the
+   * context down here -- libusb_exit(usb_ctx) then free(ctx) -- would pull both
+   * out from under that live thread: a use-after-free / race on the libusb
+   * context. Intentionally leak ctx (and usb_ctx) instead, mirroring the
+   * strmh/devh quarantine leaks. Bounded: uvc_exit() still returns immediately;
+   * the leaked thread keeps servicing a valid, never-freed context. */
+  if (ctx->has_quarantined_device) {
+    UVC_DEBUG("context %p has a quarantined device handle; leaking the context "
+              "(skipping libusb_exit + free) so the still-running event handler "
+              "thread never dereferences a freed libusb context", (void *) ctx);
+    return;
+  }
+
   if (ctx->own_usb_ctx)
     libusb_exit(ctx->usb_ctx);
 

@@ -343,6 +343,22 @@ struct uvc_context {
   uvc_device_handle_t *open_devices;
   pthread_t handler_thread;
   int kill_handler_thread;
+  /** Set once uvc_close() had to QUARANTINE a device handle on this context
+   * because uvc_stream_stop()'s bounded wait timed out with libusb transfers
+   * still outstanding (a dead/unplugged device whose cancelled transfers never
+   * completed). The quarantine branch of uvc_close() unlinks the device but
+   * deliberately does NOT set kill_handler_thread / pthread_join the event
+   * handler (that would risk the unbounded hang the bounded wait removed), so
+   * _uvc_handle_events() may still be looping on usb_ctx. While this flag is
+   * set, uvc_exit() must NOT libusb_exit(usb_ctx) or free(ctx): the running
+   * handler thread dereferences both every iteration -- freeing them is a
+   * use-after-free / race on the libusb context itself. It also gates
+   * uvc_open_internal() so a reconnect that reopens a device on this context
+   * never spawns a SECOND handler thread (the first, from the quarantined
+   * close, was never killed and keeps servicing the whole libusb context,
+   * including any newly-opened device). Intentionally leak ctx + usb_ctx,
+   * mirroring the strmh/devh quarantine leaks. Never cleared. */
+  uint8_t has_quarantined_device;
 };
 
 uvc_error_t uvc_query_stream_ctrl(

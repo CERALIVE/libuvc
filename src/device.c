@@ -400,8 +400,17 @@ static uvc_error_t uvc_open_internal(
     }
   }
 
-  if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL) {
-    /* Since this is our first device, we need to spawn the event handler thread */
+  if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL
+      && !dev->ctx->has_quarantined_device) {
+    /* Since this is our first device, we need to spawn the event handler thread.
+     * context-lifetime hotfix (round 3): but NOT if this context has a
+     * quarantined device -- open_devices was emptied when uvc_close() unlinked
+     * that quarantined handle, yet its event handler thread was intentionally
+     * never killed and is still looping on ctx->usb_ctx. Spawning here would run
+     * a SECOND thread calling libusb_handle_events_completed() on the same
+     * libusb context (a reconnect after a dead-device disconnect hits exactly
+     * this). The surviving first thread already services the whole context,
+     * including this newly-opened device, so reopening needs no new thread. */
     uvc_start_handler_thread(dev->ctx);
   }
 
@@ -1843,6 +1852,14 @@ void uvc_close(uvc_device_handle_t *devh) {
               "(intentional bounded leak) to avoid a use-after-free on a late "
               "transfer completion that dereferences devh", (void *) devh);
     DL_DELETE(ctx->open_devices, devh);
+    /* context-lifetime hotfix (round 3): this quarantine path returns WITHOUT
+     * killing/joining the event handler thread (doing so could hang on a wedged
+     * dead device), so _uvc_handle_events() may still be looping on ctx->usb_ctx.
+     * Propagate the quarantine to the context so uvc_exit() will not
+     * libusb_exit()/free() it out from under that thread, and so a reconnect's
+     * uvc_open_internal() on this same context does not spawn a duplicate
+     * handler thread. */
+    ctx->has_quarantined_device = 1;
     UVC_EXIT_VOID();
     return;
   }

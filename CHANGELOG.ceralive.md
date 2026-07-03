@@ -13,6 +13,71 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## ceralive-v0.0.7.6
+
+Security/correctness hotfix on top of `ceralive-v0.0.7.5`. Extends the round-1
+stream-handle and round-2 device-handle quarantines up one more level — to the
+**UVC context** and its libusb context / event-handler thread — off any
+healthy-device path (byte-identical streaming behavior for currently-working
+devices). Fixes a context/thread lifetime hazard the round-2 fix did not cover.
+
+### Fixed
+
+- **Use-after-free / race on the libusb context and duplicate event-handler
+  thread after a quarantined close** (fork commit — see tag `ceralive-v0.0.7.6`).
+  The `ceralive-v0.0.7.5` fix quarantines (intentionally leaks) the *device*
+  handle `devh` when `uvc_stream_stop()`'s bounded wait times out with libusb
+  transfers still outstanding. But that quarantine branch of `uvc_close()`
+  returns **without** the normal "last device" `kill_handler_thread` +
+  `pthread_join()` sequence (joining a wedged event thread would reintroduce the
+  unbounded hang the bounded wait removed), so the per-context event thread
+  `_uvc_handle_events()` is **still looping** on `ctx->usb_ctx` /
+  `ctx->kill_handler_thread` afterward. Two hazards followed from that:
+
+  1. **`uvc_exit()` (the plugin `stop()` path).** After the `DL_FOREACH` close
+     loop, `uvc_exit()` unconditionally called `libusb_exit(ctx->usb_ctx)` then
+     `free(ctx)` — tearing the libusb context and the `uvc_context_t` struct out
+     from under the still-running handler thread. Every `_uvc_handle_events()`
+     iteration dereferences both, so this is a use-after-free / race on the
+     libusb context itself, reachable on every plugin `stop()` after a quarantine.
+  2. **`uvc_open_internal()` (the plugin `reconnect()` path).** It spawns a
+     handler thread whenever `ctx->own_usb_ctx && ctx->open_devices == NULL`. The
+     quarantine unlinks the only device, emptying `open_devices`, so a reconnect
+     reopening a device on the **same** context would start a **second**
+     `_uvc_handle_events()` thread — two threads calling
+     `libusb_handle_events_completed()` on one libusb context.
+
+  A new `has_quarantined_device` flag on `struct uvc_context` closes both.
+  `uvc_close()`'s quarantine branch sets it. `uvc_exit()` then checks it and, if
+  set, **leaks the context** — skipping `libusb_exit()` and `free(ctx)` —
+  mirroring the strmh/devh quarantine leaks so the running handler thread only
+  ever reads live, never-freed memory. `uvc_open_internal()`'s handler-thread
+  spawn gains `&& !dev->ctx->has_quarantined_device`, so a reconnect never starts
+  a duplicate thread: the surviving first thread already services the whole
+  libusb context — `_uvc_handle_events()` operates at the libusb-context level,
+  not per-device — including any newly-opened device. The flag is never cleared:
+  once any device on a context has been quarantined, a leaked outstanding
+  transfer may still reference `usb_ctx`, so the context can never be safely torn
+  down. The bounded-wait guarantee is preserved (`uvc_exit()` still returns
+  immediately, never joining a wedged thread). The normal path is unchanged:
+  `uvc_close()` fully frees `devh`, then `uvc_exit()` (`has_quarantined_device`
+  clear) still `libusb_exit()`s and `free()`s the context — no leak.
+
+  Full `ctx → dev → devh → strmh` object-graph reachability was re-traced: in the
+  quarantine path nothing in that chain (nor `usb_ctx` / `usb_devh`) is freed once
+  the context is leaked, so there is no further dangling chain a late callback or
+  the lingering handler thread could dereference.
+
+  Verified with a fork-level ASan/LSan harness driving the real `uvc_exit()` and
+  the real handler thread (`_uvc_handle_events`) on a quarantined context:
+  `uvc_exit()` returns promptly and does not free the context (the handler thread
+  and a main-thread probe read live memory, ASan-clean); a reconnect spawns no
+  duplicate handler thread (exactly one ever created); the normal path fully frees
+  the context (LSan-clean). A revert-check against `ceralive-v0.0.7.5` reproduces
+  the exact use-after-free — ASan `heap-use-after-free READ` in
+  `_uvc_handle_events` (`init.c:89`), freed by `uvc_exit` (`init.c:148`) — proving
+  the test is non-vacuous.
+
 ## ceralive-v0.0.7.5
 
 Security/correctness hotfix on top of `ceralive-v0.0.7.4`. Extends the round-1
