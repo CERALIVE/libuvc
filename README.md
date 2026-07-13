@@ -56,4 +56,14 @@ Then you can start them with `./example` and `./uvc_test` respectively. Note tha
 
 The documentation for `libuvc` can currently be found at https://libuvc.github.io/.
 
+The GitHub Actions build check uses a bounded compiler cache for both CMake build
+variants. It caches only the workspace-local `.ccache` directory, keyed by the
+runner, compiler identity, and source/build workflow inputs; the `build/` and
+`build-off/` directories are never cached. Local builds do not require ccache, but
+you can enable it with CMake's compiler launcher options:
+
+    cmake -B build \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
 Happy hacking!
