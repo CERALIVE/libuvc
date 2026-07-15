@@ -311,8 +311,10 @@ fork-style-adapted commit on `hardening/v0.0.7.3` (branched from `eae7f49`, tag
 `ceralive-v0.0.7.2`). Every change is either off-by-default or a pure robustness
 guard — no negotiated default changes and byte-identical streaming behavior for
 currently-working devices. Each entry cites its **fork-commit SHA** and upstream
-provenance. Backlog IDs (A1–A14) refer to the equivalence audit in the plugin
-repo's `.omo/evidence/task-1-uvc-camera-compat-stability.md`.
+provenance. Backlog IDs (A1–A14) and their durable evidence dispositions are
+recorded in `docs/evidence/uvc-camera-compat-stability.md`. The focused
+hardware-independent assertions live in `tests/` and are enforced by the
+blocking regression gate in `.github/workflows/build.yml`.
 
 ### Added
 
