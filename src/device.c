@@ -1453,6 +1453,11 @@ uvc_error_t uvc_parse_vs_frame_format(uvc_streaming_interface_t *stream_if,
 					     size_t block_size) {
   UVC_ENTER();
 
+  if (block_size < 28) {
+    UVC_EXIT(UVC_ERROR_INVALID_DEVICE);
+    return UVC_ERROR_INVALID_DEVICE;
+  }
+
   uvc_format_desc_t *format = calloc(1, sizeof(*format));
 
   format->parent = stream_if;
@@ -1567,6 +1572,17 @@ uvc_error_t uvc_parse_vs_frame_frame(uvc_streaming_interface_t *stream_if,
   int i;
 
   UVC_ENTER();
+
+  if (block_size < 26 || !stream_if->format_descs) {
+    UVC_EXIT(UVC_ERROR_INVALID_DEVICE);
+    return UVC_ERROR_INVALID_DEVICE;
+  }
+
+  if ((block[21] == 0 && block_size < 38) ||
+      (block[21] != 0 && block_size < 26 + 4 * (size_t) block[21])) {
+    UVC_EXIT(UVC_ERROR_INVALID_DEVICE);
+    return UVC_ERROR_INVALID_DEVICE;
+  }
 
   format = stream_if->format_descs->prev;
   frame = calloc(1, sizeof(*frame));

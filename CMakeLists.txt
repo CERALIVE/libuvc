@@ -23,6 +23,8 @@ endif()
 
 option(BUILD_EXAMPLE "Build example program" ON)
 option(BUILD_TEST "Build test program" OFF)
+option(BUILD_TESTING "Build hardware-independent regression tests" OFF)
+include(CTest)
 option(ENABLE_UVC_DEBUGGING "Enable UVC debugging" OFF)
 option(LIBUVC_AUTO_DETACH_KERNEL_DRIVER
   "Auto-detach the kernel driver (e.g. uvcvideo) when claiming UVC interfaces (CeraLive)"
@@ -145,6 +147,50 @@ foreach(target_name IN LISTS UVC_TARGETS)
     )
   endif()
 endforeach()
+
+if(BUILD_TESTING)
+  if(NOT TARGET uvc_static)
+    message(FATAL_ERROR
+      "BUILD_TESTING requires CMAKE_BUILD_TARGET=Static or Both")
+  endif()
+  if(NOT UNIX OR APPLE OR NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    message(FATAL_ERROR
+      "The libuvc regression tests require Linux and GNU-compatible --wrap")
+  endif()
+
+  add_executable(uvc_descriptor_assertions tests/descriptor_assertions.c)
+  add_executable(uvc_negotiation_assertions tests/negotiation_assertions.c)
+  add_executable(uvc_transfer_assertions tests/transfer_assertions.c)
+
+  foreach(test_target
+      uvc_descriptor_assertions
+      uvc_negotiation_assertions
+      uvc_transfer_assertions)
+    target_link_libraries(${test_target}
+      PRIVATE uvc_static LibUSB::LibUSB ${threads})
+    if(JPEG_FOUND)
+      target_link_libraries(${test_target} PRIVATE JPEG::JPEG)
+    endif()
+  endforeach()
+
+  set_property(TARGET uvc_negotiation_assertions APPEND_STRING
+    PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_control_transfer -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/02-link.map")
+  set_property(TARGET uvc_transfer_assertions APPEND_STRING
+    PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_free_transfer -Wl,--wrap=free")
+
+  foreach(case_name h264 h265 truncated_format truncated_frame degenerate_h26x)
+    add_test(NAME libuvc.descriptor.${case_name}
+      COMMAND uvc_descriptor_assertions --case ${case_name})
+  endforeach()
+  foreach(case_name h264 h265 near_match probe_set_error probe_get_error)
+    add_test(NAME libuvc.negotiation.${case_name}
+      COMMAND uvc_negotiation_assertions --case ${case_name})
+  endforeach()
+  foreach(case_name terminal_statuses retry_success retry_failure)
+    add_test(NAME libuvc.transfer.${case_name}
+      COMMAND uvc_transfer_assertions --case ${case_name})
+  endforeach()
+endif()
 
 if(BUILD_EXAMPLE)
   add_executable(example src/example.c)

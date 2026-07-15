@@ -625,9 +625,15 @@ uvc_error_t uvc_probe_stream_ctrl(
     uvc_device_handle_t *devh,
     uvc_stream_ctrl_t *ctrl) {
   uvc_stream_ctrl_t required_ctrl = *ctrl;
+  uvc_error_t result;
 
-  uvc_query_stream_ctrl( devh, ctrl, 1, UVC_SET_CUR );
-  uvc_query_stream_ctrl( devh, ctrl, 1, UVC_GET_CUR );
+  result = uvc_query_stream_ctrl(devh, ctrl, 1, UVC_SET_CUR);
+  if (result != UVC_SUCCESS)
+    return result;
+
+  result = uvc_query_stream_ctrl(devh, ctrl, 1, UVC_GET_CUR);
+  if (result != UVC_SUCCESS)
+    return result;
 
   if(!_uvc_stream_params_negotiated(&required_ctrl, ctrl)) {
     UVC_DEBUG("Unable to negotiate streaming format");

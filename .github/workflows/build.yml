@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build (${{ matrix.os }})
@@ -20,14 +27,20 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Initialize regression test results
+        run: |
+          result_dir="test-results/libuvc-regression-${{ matrix.os }}"
+          mkdir -p "$result_dir"
+          printf 'os=%s\nstatus=started\n' "${{ matrix.os }}" > "$result_dir/status.txt"
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
             build-essential cmake pkg-config \
-            libusb-1.0-0-dev libjpeg-dev ccache
+            libusb-1.0-0-dev libjpeg-dev ccache jq
 
       - name: Record compiler identity
         id: compiler
@@ -39,7 +52,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'include/**', 'src/**', '.github/workflows/build.yml') }}
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'include/**', 'src/**', 'tests/**', '.github/workflows/build.yml') }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.os }}-${{ steps.compiler.outputs.fingerprint }}-
 
@@ -55,6 +68,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DBUILD_EXAMPLE=OFF \
             -DBUILD_TEST=OFF \
+            -DBUILD_TESTING=OFF \
             -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -62,16 +76,70 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
-      - name: Verify capabilities present
+      - name: Configure regression tests
         run: |
-          echo "=== H.265 support ==="
-          grep -r "UVC_FRAME_FORMAT_H265" include/ && echo "PASS: H265 enum present"
+          set -o pipefail
+          result_dir="test-results/libuvc-regression-${{ matrix.os }}"
+          cmake -S . -B "$result_dir/build" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TARGET=Static \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_TEST=OFF \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            2>&1 | tee "$result_dir/configure.log"
 
-          echo "=== UVC 1.5 header ==="
-          grep -r "0x0150" src/ && echo "PASS: UVC 1.5 case present"
+      - name: Build regression tests
+        run: |
+          set -o pipefail
+          result_dir="test-results/libuvc-regression-${{ matrix.os }}"
+          cmake --build "$result_dir/build" --parallel \
+            2>&1 | tee "$result_dir/build.log"
 
-          echo "=== Configurable auto-detach ==="
-          grep "LIBUVC_AUTO_DETACH_KERNEL_DRIVER" CMakeLists.txt && echo "PASS: auto-detach option present"
+      - name: Verify exact regression test inventory
+        run: |
+          set -o pipefail
+          result_dir="test-results/libuvc-regression-${{ matrix.os }}"
+          ctest --test-dir "$result_dir/build" --show-only=json-v1 \
+            > "$result_dir/inventory.json"
+          jq -e '
+            ([.tests[].name] | sort) == ([
+              "libuvc.descriptor.degenerate_h26x",
+              "libuvc.descriptor.h264",
+              "libuvc.descriptor.h265",
+              "libuvc.descriptor.truncated_format",
+              "libuvc.descriptor.truncated_frame",
+              "libuvc.negotiation.h264",
+              "libuvc.negotiation.h265",
+              "libuvc.negotiation.near_match",
+              "libuvc.negotiation.probe_get_error",
+              "libuvc.negotiation.probe_set_error",
+              "libuvc.transfer.retry_failure",
+              "libuvc.transfer.retry_success",
+              "libuvc.transfer.terminal_statuses"
+            ] | sort) and (.tests | length == 13)
+          ' "$result_dir/inventory.json" \
+            2>&1 | tee "$result_dir/inventory-check.log"
+
+      - name: Run regression tests
+        run: |
+          set -o pipefail
+          result_dir="$GITHUB_WORKSPACE/test-results/libuvc-regression-${{ matrix.os }}"
+          ctest --test-dir "$result_dir/build" \
+            --output-on-failure \
+            --output-junit "$result_dir/junit.xml" \
+            2>&1 | tee "$result_dir/ctest.log"
+
+      - name: Upload regression test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: libuvc-regression-${{ matrix.os }}
+          path: test-results/libuvc-regression-${{ matrix.os }}/
+          if-no-files-found: error
 
       - name: Configure + build (auto-detach OFF — rollback path)
         run: |
@@ -80,6 +148,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DBUILD_EXAMPLE=OFF \
             -DBUILD_TEST=OFF \
+            -DBUILD_TESTING=OFF \
             -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache

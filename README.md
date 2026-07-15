@@ -39,7 +39,7 @@ Prerequisites: You will need `libusb` and [CMake](http://www.cmake.org/) install
 
 To build, you can just run these shell commands:
 
-    git clone https://github.com/libuvc/libuvc
+    git clone https://github.com/CERALIVE/libuvc
     cd libuvc
     mkdir build
     cd build
@@ -49,8 +49,30 @@ To build, you can just run these shell commands:
 and you're set! If you want to change the build configuration, you can edit `CMakeCache.txt`
 in the build directory, or use a CMake GUI to make the desired changes.
 
-There is also `BUILD_EXAMPLE` and `BUILD_TEST` options to enable the compilation of `example` and `uvc_test` programs. To use them, replace the `cmake ..` command above with `cmake .. -DBUILD_TEST=ON -DBUILD_EXAMPLE=ON`.
-Then you can start them with `./example` and `./uvc_test` respectively. Note that you need OpenCV to build the later (for displaying image).
+`BUILD_EXAMPLE` enables the example program. `BUILD_TEST` enables `uvc_test`, an
+interactive OpenCV demo that needs a real UVC camera and a display; it is not the
+automated test suite. `BUILD_TESTING` enables the default-off, hardware-independent
+Linux CTest suite. Configure, build, inspect, and run its static build with:
+
+    cmake -S . -B build/regression \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_BUILD_TARGET=Static \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DBUILD_EXAMPLE=OFF \
+      -DBUILD_TEST=OFF \
+      -DBUILD_TESTING=ON
+    cmake --build build/regression --parallel
+    ctest --test-dir build/regression --show-only=json-v1 \
+      | jq -e '.tests | length == 13'
+    ctest --test-dir build/regression --output-on-failure
+
+The 13 cases are grouped as descriptor (5: `h264`, `h265`,
+`truncated_format`, `truncated_frame`, `degenerate_h26x`), negotiation (5:
+`h264`, `h265`, `near_match`, `probe_set_error`, `probe_get_error`), and
+transfer (3: `terminal_statuses`, `retry_success`, `retry_failure`). CI runs
+this suite without camera hardware on Ubuntu 22.04 and Ubuntu 24.04. See
+`docs/evidence/uvc-camera-compat-stability.md` for its exact scope.
 
 ## Developing with libuvc
 
