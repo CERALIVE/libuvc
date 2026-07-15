@@ -64,14 +64,17 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       -DBUILD_TESTING=ON
     cmake --build build/regression --parallel
     ctest --test-dir build/regression --show-only=json-v1 \
-      | jq -e '.tests | length == 13'
+      | jq -e '.tests | length == 19'
     ctest --test-dir build/regression --output-on-failure
 
-The 13 cases are grouped as descriptor (5: `h264`, `h265`,
-`truncated_format`, `truncated_frame`, `degenerate_h26x`), negotiation (5:
-`h264`, `h265`, `near_match`, `probe_set_error`, `probe_get_error`), and
-transfer (3: `terminal_statuses`, `retry_success`, `retry_failure`). CI runs
-this suite without camera hardware on Ubuntu 22.04 and Ubuntu 24.04. See
+The 19 cases are grouped as descriptor (11: `h264`, `h265`,
+`truncated_format`, `truncated_frame`, `degenerate_h26x`,
+`scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
+`scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
+negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
+`probe_get_error`), and transfer (3: `terminal_statuses`, `retry_success`,
+`retry_failure`). CI runs this suite without camera hardware on Ubuntu 22.04
+and Ubuntu 24.04. See
 `docs/evidence/uvc-camera-compat-stability.md` for its exact scope.
 
 ## Developing with libuvc

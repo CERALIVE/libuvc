@@ -9,6 +9,15 @@ uvc_error_t uvc_parse_vs_frame_format(uvc_streaming_interface_t *,
                                       const unsigned char *, size_t);
 uvc_error_t uvc_parse_vs_frame_frame(uvc_streaming_interface_t *,
                                      const unsigned char *, size_t);
+uvc_error_t uvc_scan_control(uvc_device_handle_t *, uvc_device_info_t *);
+uvc_error_t uvc_scan_streaming(uvc_device_t *, uvc_device_info_t *, int);
+
+int __wrap_libusb_get_device_descriptor(
+    libusb_device *device, struct libusb_device_descriptor *descriptor) {
+  (void) device;
+  (void) descriptor;
+  return LIBUSB_ERROR_NO_DEVICE;
+}
 
 #define CHECK(expression) do { \
   if (!(expression)) { \
@@ -74,6 +83,66 @@ static void release_stream(uvc_streaming_interface_t *stream_if) {
     free(format);
   }
   stream_if->format_descs = NULL;
+}
+
+static uvc_error_t scan_streaming_extra(const unsigned char *extra,
+                                        size_t extra_length) {
+  unsigned char *owned_extra = malloc(extra_length);
+  struct libusb_interface_descriptor altsetting = {0};
+  struct libusb_interface interface = {0};
+  struct libusb_config_descriptor config = {0};
+  uvc_device_info_t info = {0};
+  uvc_device_t device = {0};
+  uvc_error_t result;
+
+  if (!owned_extra)
+    return UVC_ERROR_NO_MEM;
+  memcpy(owned_extra, extra, extra_length);
+  altsetting.extra = owned_extra;
+  altsetting.extra_length = (int) extra_length;
+  interface.altsetting = &altsetting;
+  interface.num_altsetting = 1;
+  config.interface = &interface;
+  config.bNumInterfaces = 1;
+  info.config = &config;
+
+  result = uvc_scan_streaming(&device, &info, 0);
+  if (info.stream_ifs) {
+    release_stream(info.stream_ifs);
+    free(info.stream_ifs);
+  }
+  free(owned_extra);
+  return result;
+}
+
+static uvc_error_t scan_control_extra(const unsigned char *extra,
+                                      size_t extra_length) {
+  unsigned char *owned_extra = malloc(extra_length);
+  struct libusb_interface_descriptor altsetting = {0};
+  struct libusb_interface interface = {0};
+  struct libusb_config_descriptor config = {0};
+  uvc_device_info_t info = {0};
+  uvc_device_t device = {0};
+  uvc_device_handle_t device_handle = {0};
+  uvc_error_t result;
+
+  if (!owned_extra)
+    return UVC_ERROR_NO_MEM;
+  memcpy(owned_extra, extra, extra_length);
+  altsetting.bInterfaceClass = 14;
+  altsetting.bInterfaceSubClass = 1;
+  altsetting.extra = owned_extra;
+  altsetting.extra_length = (int) extra_length;
+  interface.altsetting = &altsetting;
+  interface.num_altsetting = 1;
+  config.interface = &interface;
+  config.bNumInterfaces = 1;
+  info.config = &config;
+  device_handle.dev = &device;
+
+  result = uvc_scan_control(&device_handle, &info);
+  free(owned_extra);
+  return result;
 }
 
 static int check_codec(const unsigned char guid[16]) {
@@ -155,6 +224,76 @@ static int check_degenerate(void) {
   return EXIT_SUCCESS;
 }
 
+static int check_scanner_vs_oversized(void) {
+  const unsigned char extra[3] = {
+    28, 0x24, UVC_VS_FORMAT_FRAME_BASED
+  };
+
+  /* Given a three-byte VS descriptor that declares 28 bytes. */
+  /* When the production VideoStreaming scanner walks the descriptor. */
+  uvc_error_t result = scan_streaming_extra(extra, sizeof(extra));
+  /* Then it rejects the descriptor before parser dispatch. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
+static int check_scanner_vs_zero(void) {
+  const unsigned char extra[3] = {0, 0x24, UVC_VS_OUTPUT_HEADER};
+
+  /* Given a complete VS header whose declared length is zero. */
+  /* When the production VideoStreaming scanner walks the descriptor. */
+  uvc_error_t result = scan_streaming_extra(extra, sizeof(extra));
+  /* Then it rejects the descriptor without stalling. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
+static int check_scanner_vs_header_short(void) {
+  const unsigned char extra[2] = {2, 0x24};
+
+  /* Given a VS extra block shorter than the three-byte header. */
+  /* When the production VideoStreaming scanner walks the descriptor. */
+  uvc_error_t result = scan_streaming_extra(extra, sizeof(extra));
+  /* Then it rejects the incomplete header. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
+static int check_scanner_vc_oversized(void) {
+  const unsigned char extra[3] = {
+    28, 0x24, UVC_VC_INPUT_TERMINAL
+  };
+
+  /* Given a three-byte VC descriptor that declares 28 bytes. */
+  /* When the production VideoControl scanner walks the descriptor. */
+  uvc_error_t result = scan_control_extra(extra, sizeof(extra));
+  /* Then it rejects the descriptor before parser dispatch. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
+static int check_scanner_vc_zero(void) {
+  const unsigned char extra[3] = {0, 0x24, UVC_VC_OUTPUT_TERMINAL};
+
+  /* Given a complete VC header whose declared length is zero. */
+  /* When the production VideoControl scanner walks the descriptor. */
+  uvc_error_t result = scan_control_extra(extra, sizeof(extra));
+  /* Then it rejects the descriptor without stalling. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
+static int check_scanner_vc_header_short(void) {
+  const unsigned char extra[2] = {2, 0x24};
+
+  /* Given a VC extra block shorter than the three-byte header. */
+  /* When the production VideoControl scanner walks the descriptor. */
+  uvc_error_t result = scan_control_extra(extra, sizeof(extra));
+  /* Then it rejects the incomplete header. */
+  CHECK(result == UVC_ERROR_INVALID_DEVICE);
+  return EXIT_SUCCESS;
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 3 && strcmp(argv[1], "--case") == 0);
   if (strcmp(argv[2], "h264") == 0)
@@ -167,6 +306,18 @@ int main(int argc, char **argv) {
     return check_truncated_frame();
   if (strcmp(argv[2], "degenerate_h26x") == 0)
     return check_degenerate();
+  if (strcmp(argv[2], "scanner_vs_oversized") == 0)
+    return check_scanner_vs_oversized();
+  if (strcmp(argv[2], "scanner_vs_zero") == 0)
+    return check_scanner_vs_zero();
+  if (strcmp(argv[2], "scanner_vs_header_short") == 0)
+    return check_scanner_vs_header_short();
+  if (strcmp(argv[2], "scanner_vc_oversized") == 0)
+    return check_scanner_vc_oversized();
+  if (strcmp(argv[2], "scanner_vc_zero") == 0)
+    return check_scanner_vc_zero();
+  if (strcmp(argv[2], "scanner_vc_header_short") == 0)
+    return check_scanner_vc_header_short();
   fprintf(stderr, "unknown case: %s\n", argv[2]);
   return EXIT_FAILURE;
 }
