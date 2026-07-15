@@ -13,6 +13,16 @@ the upstream history, see `changelog.txt`.
 - **License:** BSD-3-Clause, preserved verbatim (`LICENSE.txt`). CeraLive
   additions are also BSD-3-Clause.
 
+## Unreleased
+
+### Fixed
+
+- **Reject inconsistent UVC descriptor lengths before parser dispatch.** The
+  VideoControl and VideoStreaming descriptor scanners now return
+  `UVC_ERROR_INVALID_DEVICE` for a declared length below the three-byte header
+  or beyond the remaining descriptor bytes. The hardware-independent CTest
+  gate covers zero, short, and oversized synthetic descriptors for both paths.
+
 ## ceralive-v0.0.7.8
 
 Security/correctness hotfix on top of `ceralive-v0.0.7.7`. Fixes a

@@ -173,15 +173,33 @@ if(BUILD_TESTING)
     endif()
   endforeach()
 
+  set_property(TARGET uvc_descriptor_assertions APPEND_STRING
+    PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_get_device_descriptor")
+
   set_property(TARGET uvc_negotiation_assertions APPEND_STRING
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_control_transfer -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/02-link.map")
   set_property(TARGET uvc_transfer_assertions APPEND_STRING
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_free_transfer -Wl,--wrap=free")
 
-  foreach(case_name h264 h265 truncated_format truncated_frame degenerate_h26x)
+  foreach(case_name
+      h264
+      h265
+      truncated_format
+      truncated_frame
+      degenerate_h26x
+      scanner_vs_oversized
+      scanner_vs_zero
+      scanner_vs_header_short
+      scanner_vc_oversized
+      scanner_vc_zero
+      scanner_vc_header_short)
     add_test(NAME libuvc.descriptor.${case_name}
       COMMAND uvc_descriptor_assertions --case ${case_name})
   endforeach()
+  set_tests_properties(
+    libuvc.descriptor.scanner_vs_zero
+    libuvc.descriptor.scanner_vc_zero
+    PROPERTIES TIMEOUT 2)
   foreach(case_name h264 h265 near_match probe_set_error probe_get_error)
     add_test(NAME libuvc.negotiation.${case_name}
       COMMAND uvc_negotiation_assertions --case ${case_name})
@@ -275,5 +293,4 @@ install(FILES
 install(FILES libuvcConfig.cmake
   DESTINATION ${CMAKE_INSTALL_CMAKEDIR}
 )
-
 

@@ -1114,8 +1114,12 @@ uvc_error_t uvc_scan_control(uvc_device_handle_t *devh, uvc_device_info_t *info)
   buffer = if_desc->extra;
   buffer_left = if_desc->extra_length;
 
-  while (buffer_left >= 3) { // parseX needs to see buf[0,2] = length,type
+  while (buffer_left > 0) {
     block_size = buffer[0];
+    if (block_size < 3 || block_size > buffer_left) {
+      ret = UVC_ERROR_INVALID_DEVICE;
+      break;
+    }
     parse_ret = uvc_parse_vc(devh->dev, info, buffer, block_size);
 
     if (parse_ret != UVC_SUCCESS) {
@@ -1380,8 +1384,12 @@ uvc_error_t uvc_scan_streaming(uvc_device_t *dev,
   stream_if->bInterfaceNumber = if_desc->bInterfaceNumber;
   DL_APPEND(info->stream_ifs, stream_if);
 
-  while (buffer_left >= 3) {
+  while (buffer_left > 0) {
     block_size = buffer[0];
+    if (block_size < 3 || block_size > buffer_left) {
+      ret = UVC_ERROR_INVALID_DEVICE;
+      break;
+    }
     parse_ret = uvc_parse_vs(dev, info, stream_if, buffer, block_size);
 
     if (parse_ret != UVC_SUCCESS) {
