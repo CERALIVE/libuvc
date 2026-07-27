@@ -67,15 +67,38 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       | jq -e '.tests | length == 19'
     ctest --test-dir build/regression --output-on-failure
 
-The 19 cases are grouped as descriptor (11: `h264`, `h265`,
+The 23 cases are grouped as descriptor (11: `h264`, `h265`,
 `truncated_format`, `truncated_frame`, `degenerate_h26x`,
 `scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
 `scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
 negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
-`probe_get_error`), and transfer (3: `terminal_statuses`, `retry_success`,
-`retry_failure`). CI runs this suite without camera hardware on Ubuntu 22.04
+`probe_get_error`), transfer (3: `terminal_statuses`, `retry_success`,
+`retry_failure`), and teardown (4: `status_xfer_stops_before_control_release`,
+`every_claimed_interface_released_control_last`,
+`no_status_endpoint_unchanged`, `undeliverable_status_xfer_quarantines`).
+CI runs this suite without camera hardware on Ubuntu 22.04
 and Ubuntu 24.04. See
 `docs/evidence/uvc-camera-compat-stability.md` for its exact scope.
+
+Adjust the `jq` length assertion above to `23` when running it.
+
+### Device teardown contract
+
+`uvc_close()` owns the whole USB teardown and must keep two invariants that are
+not visible from the call site — both are regression-locked by the
+`libuvc.teardown.*` cases:
+
+1. **The VideoControl status interrupt transfer is stopped before any interface
+   is released.** It re-arms itself from `_uvc_status_callback()`, so a
+   resubmission that lands after the release makes usbfs re-claim the interface
+   from the kernel driver it was just handed back to; the final `libusb_close()`
+   then leaves it bound to nothing and the camera's `/dev/videoN` never returns.
+   `status_mutex` keeps the callback's stopping-check and its resubmission atomic
+   against that stop.
+2. **Every interface in `devh->claimed` is released, VideoControl LAST.** A
+   failed negotiation can leave the streaming interface claimed, and reattaching
+   the driver to VideoControl is what triggers `uvcvideo`'s probe — a probe that
+   claims the streaming interfaces itself, so it must run after they are free.
 
 ## Developing with libuvc
 

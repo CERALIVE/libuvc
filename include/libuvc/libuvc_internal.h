@@ -11,6 +11,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <libusb.h>
 #include "utlist.h"
 
@@ -252,6 +253,19 @@ typedef struct uvc_device_info {
 #define LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS 5
 #endif
 
+/* Bound uvc_close()'s wait for the VideoControl status interrupt transfer to come
+ * back after it is cancelled, mirroring the stream-stop bound above: a wedged
+ * event thread must not hang the caller. The endpoint's bInterval is typically
+ * 8-32 ms, so a cancellation normally lands within one interval; the default is
+ * an order of magnitude above that.
+ */
+#ifndef LIBUVC_STATUS_STOP_TIMEOUT_MS
+#define LIBUVC_STATUS_STOP_TIMEOUT_MS 500
+#endif
+#ifndef LIBUVC_STATUS_STOP_POLL_MS
+#define LIBUVC_STATUS_STOP_POLL_MS 2
+#endif
+
 #define LIBUVC_XFER_META_BUF_SIZE ( 4 * 1024 )
 
 struct uvc_stream_handle {
@@ -331,6 +345,31 @@ struct uvc_device_handle {
    * handle (uvc_free_devh) or tear down anything it owns; it quarantines the
    * device handle too, mirroring the stream-handle leak. Never cleared. */
   uint8_t has_quarantined_stream;
+  /** Serializes _uvc_status_callback()'s decide-and-resubmit against
+   * uvc_stop_status_xfer()'s stop-and-cancel. Both flags below are read and
+   * written under it. Without the mutex the two interleave: the callback can
+   * read status_xfer_stopping as 0, lose the CPU, and issue its resubmission
+   * after uvc_stop_status_xfer() has already returned and uvc_close() has
+   * released the VideoControl interface -- the exact URB-after-release the stop
+   * exists to prevent. Initialized in uvc_open_internal(), destroyed in
+   * uvc_free_devh(). */
+  pthread_mutex_t status_mutex;
+  /** Non-zero while `status_xfer` is submitted to libusb -- set when
+   * uvc_open_internal() submits it, cleared by _uvc_status_callback() on the
+   * libusb event thread once the transfer is no longer resubmitted. Polled by
+   * uvc_stop_status_xfer() on the closing thread, hence `volatile`. */
+  volatile uint8_t status_xfer_submitted;
+  /** Set by uvc_stop_status_xfer() BEFORE it cancels `status_xfer`: tells
+   * _uvc_status_callback() to stop resubmitting. Without it the callback keeps
+   * re-arming the interrupt URB on the VideoControl interface AFTER uvc_close()
+   * released that interface and reattached the kernel driver -- usbfs then logs
+   * "did not claim interface N before use" and steals the interface back, so the
+   * final libusb_close() leaves it bound to no driver at all. Never cleared. */
+  volatile uint8_t status_xfer_stopping;
+  /** Set when uvc_stop_status_xfer()'s bounded wait expired with `status_xfer`
+   * still owned by libusb. Quarantines the handle for the same reason
+   * has_quarantined_stream does: a late callback dereferences devh. */
+  uint8_t has_quarantined_status_xfer;
 };
 
 /** Context within which we communicate with devices */

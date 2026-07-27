@@ -17,6 +17,54 @@ the upstream history, see `changelog.txt`.
 
 ### Fixed
 
+- **`uvc_close()` left the camera's kernel driver detached, so `/dev/videoN`
+  never came back.** Two independent teardown defects, both reproduced on a
+  Rockchip RK3588 board with a DJI Osmo Pocket 3:
+
+  1. **The VideoControl status interrupt transfer was never stopped.**
+     `uvc_open_internal()` submits it when the VideoControl interface carries a
+     status interrupt endpoint (optional in UVC, but present on most cameras),
+     and `_uvc_status_callback()` re-arms it after every completion.
+     `uvc_close()` never cancelled or freed it, so it kept re-arming while the
+     close released that same interface and handed it back to `uvcvideo`. The
+     resubmission then reached usbfs on an interface the process no longer
+     claimed:
+
+     ```
+     usb 5-1: usbfs: process 104350 (...) did not claim interface 0 before use
+     ```
+
+     usbfs re-claims the interface on that path, evicting the driver that had
+     just been reattached, and the following `libusb_close()` drops the claim
+     without rebinding anything — leaving the interface with no driver at all.
+     `uvc_close()` now cancels the transfer and waits, bounded
+     (`LIBUVC_STATUS_STOP_TIMEOUT_MS`, default 500 ms), before touching any
+     interface. A new `status_mutex` makes the callback's stopping-check and its
+     resubmission one critical section with that stop, so a resubmission cannot
+     slip between them. A drain that times out quarantines the handle exactly as
+     a wedged stream already does, rather than freeing memory libusb still
+     references.
+
+  2. **Only the VideoControl interface was released.**
+     `uvc_get_stream_ctrl_format_size()` claims the streaming interface before
+     it probes and returns `UVC_ERROR_INVALID_MODE` without releasing it, and
+     `uvc_stream_open_ctrl()`'s failure path frees the stream handle without
+     releasing it either — so any failed negotiation orphaned that interface
+     until `libusb_close()` dropped the usbfs fd, which does not rebind a kernel
+     driver. `uvc_close()` now releases every interface still in `devh->claimed`,
+     **VideoControl last**: reattaching the driver to VideoControl is what makes
+     `uvcvideo` probe the whole function, and that probe claims the
+     VideoStreaming interfaces itself, so releasing control first made it log
+     `No streaming interface found for terminal N` and register no video node.
+
+  Cameras whose VideoControl interface exposes no status endpoint (e.g. the RØDE
+  HDMI-to-USB-C) never submitted the transfer and are unaffected by (1); their
+  teardown is byte-identical.
+
+  Covered by four new hardware-independent CTest cases
+  (`libuvc.teardown.*`) that `--wrap` the libusb entry points into an ordered
+  operation log and drive the real `uvc_close()`.
+
 - **Reject inconsistent UVC descriptor lengths before parser dispatch.** The
   VideoControl and VideoStreaming descriptor scanners now return
   `UVC_ERROR_INVALID_DEVICE` for a declared length below the three-byte header
