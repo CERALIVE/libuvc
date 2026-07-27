@@ -125,8 +125,12 @@ jobs:
               "libuvc.negotiation.probe_set_error",
               "libuvc.transfer.retry_failure",
               "libuvc.transfer.retry_success",
-              "libuvc.transfer.terminal_statuses"
-            ] | sort) and (.tests | length == 19)
+              "libuvc.transfer.terminal_statuses",
+              "libuvc.teardown.status_xfer_stops_before_control_release",
+              "libuvc.teardown.every_claimed_interface_released_control_last",
+              "libuvc.teardown.no_status_endpoint_unchanged",
+              "libuvc.teardown.undeliverable_status_xfer_quarantines"
+            ] | sort) and (.tests | length == 23)
           ' "$result_dir/inventory.json" \
             2>&1 | tee "$result_dir/inventory-check.log"
 
