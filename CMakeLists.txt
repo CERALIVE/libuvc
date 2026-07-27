@@ -161,11 +161,13 @@ if(BUILD_TESTING)
   add_executable(uvc_descriptor_assertions tests/descriptor_assertions.c)
   add_executable(uvc_negotiation_assertions tests/negotiation_assertions.c)
   add_executable(uvc_transfer_assertions tests/transfer_assertions.c)
+  add_executable(uvc_teardown_assertions tests/teardown_assertions.c)
 
   foreach(test_target
       uvc_descriptor_assertions
       uvc_negotiation_assertions
-      uvc_transfer_assertions)
+      uvc_transfer_assertions
+      uvc_teardown_assertions)
     target_link_libraries(${test_target}
       PRIVATE uvc_static LibUSB::LibUSB ${threads})
     if(JPEG_FOUND)
@@ -180,6 +182,8 @@ if(BUILD_TESTING)
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_control_transfer -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/02-link.map")
   set_property(TARGET uvc_transfer_assertions APPEND_STRING
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_free_transfer -Wl,--wrap=free")
+  set_property(TARGET uvc_teardown_assertions APPEND_STRING
+    PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_cancel_transfer -Wl,--wrap=libusb_release_interface -Wl,--wrap=libusb_attach_kernel_driver -Wl,--wrap=libusb_set_interface_alt_setting -Wl,--wrap=libusb_close -Wl,--wrap=libusb_unref_device -Wl,--wrap=nanosleep")
 
   foreach(case_name
       h264
@@ -208,6 +212,17 @@ if(BUILD_TESTING)
     add_test(NAME libuvc.transfer.${case_name}
       COMMAND uvc_transfer_assertions --case ${case_name})
   endforeach()
+  foreach(case_name
+      status_xfer_stops_before_control_release
+      every_claimed_interface_released_control_last
+      no_status_endpoint_unchanged
+      undeliverable_status_xfer_quarantines)
+    add_test(NAME libuvc.teardown.${case_name}
+      COMMAND uvc_teardown_assertions --case ${case_name})
+  endforeach()
+  set_tests_properties(
+    libuvc.teardown.undeliverable_status_xfer_quarantines
+    PROPERTIES TIMEOUT 5)
 endif()
 
 if(BUILD_EXAMPLE)

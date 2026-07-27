@@ -361,6 +361,7 @@ static uvc_error_t uvc_open_internal(
   internal_devh = calloc(1, sizeof(*internal_devh));
   internal_devh->dev = dev;
   internal_devh->usb_devh = usb_devh;
+  pthread_mutex_init(&internal_devh->status_mutex, NULL);
 
   ret = uvc_get_device_info(internal_devh, &(internal_devh->info));
 
@@ -398,6 +399,10 @@ static uvc_error_t uvc_open_internal(
               "uvc: device has a status interrupt endpoint, but unable to read from it\n");
       goto fail;
     }
+    /* libusb now owns the transfer, and _uvc_status_callback() re-arms it after
+     * every completion. uvc_close() MUST stop it before releasing the
+     * VideoControl interface it rides on -- see uvc_stop_status_xfer(). */
+    internal_devh->status_xfer_submitted = 1;
   }
 
   if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL
@@ -1827,12 +1832,112 @@ void uvc_free_devh(uvc_device_handle_t *devh) {
   if (devh->info)
     uvc_free_device_info(devh->info);
 
-  if (devh->status_xfer)
+  /* libusb forbids freeing a transfer it still owns. status_xfer_submitted is
+   * only still set on the quarantine path, which never reaches here. */
+  if (devh->status_xfer && !devh->status_xfer_submitted)
     libusb_free_transfer(devh->status_xfer);
+
+  pthread_mutex_destroy(&devh->status_mutex);
 
   free(devh);
 
   UVC_EXIT_VOID();
+}
+
+/** @internal
+ * @brief Stop the VideoControl status interrupt transfer and wait, bounded, for
+ * libusb to hand it back.
+ *
+ * The status endpoint lives on the VideoControl interface, and
+ * _uvc_status_callback() re-arms the URB after every completion -- including a
+ * timeout -- for the whole life of the handle. uvc_close() used to release that
+ * interface (and, via libusb_attach_kernel_driver(), hand it back to uvcvideo)
+ * with the URB still in flight, so the next resubmission reached usbfs on an
+ * interface the process no longer claimed. The kernel logs
+ *
+ *   usbfs: process N (...) did not claim interface 0 before use
+ *
+ * and re-claims the interface for usbfs, evicting the driver that had just been
+ * reattached. The subsequent libusb_close() then drops that claim WITHOUT
+ * rebinding anything, leaving the interface with no driver at all: the camera's
+ * /dev/videoN never returns and only a USB unbind/bind recovers it.
+ *
+ * Only devices whose VideoControl interface carries the (optional) status
+ * interrupt endpoint were affected, which is why it reproduced on one camera and
+ * not another on the same board.
+ *
+ * @return 1 when the transfer is confirmed no longer submitted, 0 on timeout.
+ */
+static int uvc_stop_status_xfer(uvc_device_handle_t *devh) {
+  struct timespec poll;
+  int waited_ms;
+  int cancelled;
+
+  if (!devh->status_xfer)
+    return 1;
+
+  /* Taking the lock is what makes this safe: if the callback is mid-flight it
+   * either has not reached its stopping check (and will see the flag set here)
+   * or is already inside its submit (and this blocks until that submit is
+   * recorded, so the cancel below applies to it). Either way no submission can
+   * outlive this call. */
+  pthread_mutex_lock(&devh->status_mutex);
+  devh->status_xfer_stopping = 1;
+  if (!devh->status_xfer_submitted) {
+    pthread_mutex_unlock(&devh->status_mutex);
+    return 1;
+  }
+  cancelled = libusb_cancel_transfer(devh->status_xfer) == LIBUSB_SUCCESS;
+  pthread_mutex_unlock(&devh->status_mutex);
+
+  if (!cancelled) {
+    /* NOT_FOUND means libusb has already reaped it; the callback either ran
+     * under the lock above or will now observe status_xfer_stopping. */
+    devh->status_xfer_submitted = 0;
+    return 1;
+  }
+
+  poll.tv_sec = 0;
+  poll.tv_nsec = (long) LIBUVC_STATUS_STOP_POLL_MS * 1000000L;
+  for (waited_ms = 0;
+       devh->status_xfer_submitted && waited_ms < LIBUVC_STATUS_STOP_TIMEOUT_MS;
+       waited_ms += LIBUVC_STATUS_STOP_POLL_MS) {
+    nanosleep(&poll, NULL);
+  }
+
+  return devh->status_xfer_submitted ? 0 : 1;
+}
+
+/** @internal
+ * @brief Release every interface this handle still claims, VideoControl LAST.
+ *
+ * uvc_close() used to release only the VideoControl interface, so a streaming
+ * interface claimed by a negotiation that never reached uvc_stream_close() stayed
+ * claimed until libusb_close() dropped the usbfs fd -- and dropping the fd does
+ * NOT rebind a kernel driver, so the interface was left driverless.
+ * uvc_get_stream_ctrl_format_size() claims the streaming interface before it
+ * probes and returns UVC_ERROR_INVALID_MODE without releasing it, and
+ * uvc_stream_open_ctrl()'s failure path frees the stream handle without
+ * releasing it either, so any failed negotiation orphaned that interface.
+ *
+ * The order is load-bearing. Reattaching the driver to the VideoControl
+ * interface is what makes uvcvideo probe the whole UVC function, and that probe
+ * claims the VideoStreaming interfaces itself. Releasing control first makes the
+ * probe run while the streaming interfaces are still held by usbfs, so it logs
+ * "No streaming interface found for terminal N" and registers no video node.
+ */
+static void uvc_release_claimed_ifs(uvc_device_handle_t *devh) {
+  const int ctrl_idx = devh->info ? (int) devh->info->ctrl_if.bInterfaceNumber : -1;
+  const int max_idx = (int) (8 * sizeof(devh->claimed));
+  int idx;
+
+  for (idx = 0; idx < max_idx; idx++) {
+    if (idx != ctrl_idx && (devh->claimed & (1u << idx)))
+      uvc_release_if(devh, idx);
+  }
+
+  if (ctrl_idx >= 0)
+    uvc_release_if(devh, ctrl_idx);
 }
 
 /** @brief Close a device
@@ -1849,6 +1954,12 @@ void uvc_close(uvc_device_handle_t *devh) {
 
   if (devh->streams)
     uvc_stop_streaming(devh);
+
+  /* The status interrupt transfer rides the VideoControl interface's endpoint and
+   * re-arms itself from _uvc_status_callback(), so it MUST be stopped before that
+   * interface is released below -- see uvc_stop_status_xfer(). */
+  if (!uvc_stop_status_xfer(devh))
+    devh->has_quarantined_status_xfer = 1;
 
   /* devh-lifetime hotfix (round 2): if uvc_stop_streaming() -> uvc_stream_close()
    * had to quarantine any of this device's streams (a dead/unplugged device
@@ -1869,12 +1980,15 @@ void uvc_close(uvc_device_handle_t *devh) {
    * devh only via transfer->user_data -> strmh -> devh, never by walking
    * open_devices, so the unlink is safe and keeps uvc_exit()/a later uvc_close()
    * from re-visiting (double-freeing, or mis-detecting the "last device") this
-   * quarantined handle. */
-  if (devh->has_quarantined_stream) {
-    UVC_DEBUG("device handle %p has a quarantined stream (stream stop timed out "
-              "with transfers still in flight); quarantining the device handle "
+   * quarantined handle. The same reasoning covers has_quarantined_status_xfer:
+   * a status transfer libusb still owns has user_data -> THIS handle, so freeing
+   * or closing here would be the same use-after-free one indirection shorter. */
+  if (devh->has_quarantined_stream || devh->has_quarantined_status_xfer) {
+    UVC_DEBUG("device handle %p has a quarantined %s (bounded stop wait timed out "
+              "with a transfer still in flight); quarantining the device handle "
               "(intentional bounded leak) to avoid a use-after-free on a late "
-              "transfer completion that dereferences devh", (void *) devh);
+              "transfer completion that dereferences devh", (void *) devh,
+              devh->has_quarantined_stream ? "stream" : "status transfer");
     DL_DELETE(ctx->open_devices, devh);
     /* context-lifetime hotfix (round 3): this quarantine path returns WITHOUT
      * killing/joining the event handler thread (doing so could hang on a wedged
@@ -1888,7 +2002,7 @@ void uvc_close(uvc_device_handle_t *devh) {
     return;
   }
 
-  uvc_release_if(devh, devh->info->ctrl_if.bInterfaceNumber);
+  uvc_release_claimed_ifs(devh);
 
   /* If we are managing the libusb context and this is the last open device,
    * then we need to cancel the handler thread. When we call libusb_close,
@@ -2087,12 +2201,14 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
   UVC_ENTER();
 
   uvc_device_handle_t *devh = (uvc_device_handle_t *) transfer->user_data;
+  int ret;
 
   switch (transfer->status) {
   case LIBUSB_TRANSFER_ERROR:
   case LIBUSB_TRANSFER_CANCELLED:
   case LIBUSB_TRANSFER_NO_DEVICE:
     UVC_DEBUG("not processing/resubmitting, status = %d", transfer->status);
+    devh->status_xfer_submitted = 0;
     UVC_EXIT_VOID();
     return;
   case LIBUSB_TRANSFER_COMPLETED:
@@ -2105,11 +2221,28 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
     break;
   }
 
-#ifdef UVC_DEBUGGING
-  uvc_error_t ret =
-#endif
-      libusb_submit_transfer(transfer);
+  /* Teardown started: do NOT re-arm. Resubmitting here races uvc_close()'s
+   * uvc_release_if() on the VideoControl interface this endpoint belongs to, and
+   * a URB that lands after the release makes usbfs re-claim the interface out
+   * from under the kernel driver it was just handed back to.
+   *
+   * The check and the submit MUST be one critical section with
+   * uvc_stop_status_xfer(): testing the flag and then submitting outside the lock
+   * lets the stop slip in between, so the resubmission still lands after the
+   * release it was supposed to precede. */
+  pthread_mutex_lock(&devh->status_mutex);
+  if (devh->status_xfer_stopping) {
+    devh->status_xfer_submitted = 0;
+    pthread_mutex_unlock(&devh->status_mutex);
+    UVC_EXIT_VOID();
+    return;
+  }
+
+  ret = libusb_submit_transfer(transfer);
   UVC_DEBUG("libusb_submit_transfer() = %d", ret);
+  if (ret != LIBUSB_SUCCESS)
+    devh->status_xfer_submitted = 0;
+  pthread_mutex_unlock(&devh->status_mutex);
 
   UVC_EXIT_VOID();
 }
