@@ -29,6 +29,25 @@ option(ENABLE_UVC_DEBUGGING "Enable UVC debugging" OFF)
 option(LIBUVC_AUTO_DETACH_KERNEL_DRIVER
   "Auto-detach the kernel driver (e.g. uvcvideo) when claiming UVC interfaces (CeraLive)"
   ON)
+set(LIBUVC_SANITIZE "" CACHE STRING
+  "Sanitizer to build library and tests with: thread, address, or empty (CeraLive)")
+set_property(CACHE LIBUVC_SANITIZE PROPERTY STRINGS "" thread address)
+
+if(LIBUVC_SANITIZE)
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    message(FATAL_ERROR "LIBUVC_SANITIZE requires a GNU-compatible compiler")
+  endif()
+  # Instrumentation has to reach the library, not just the test executable:
+  # the races being hunted live in src/device.c, on the libusb event thread.
+  add_compile_options(-fsanitize=${LIBUVC_SANITIZE} -fno-omit-frame-pointer -g)
+  # Not add_link_options(): that needs CMake 3.13 and this project declares 3.1.
+  foreach(linker_flags
+      CMAKE_EXE_LINKER_FLAGS
+      CMAKE_SHARED_LINKER_FLAGS)
+    set(${linker_flags} "${${linker_flags}} -fsanitize=${LIBUVC_SANITIZE}")
+  endforeach()
+  message(STATUS "Building with -fsanitize=${LIBUVC_SANITIZE}")
+endif()
 
 set(libuvc_DESCRIPTION "A cross-platform library for USB video devices")
 set(libuvc_URL "https://github.com/libuvc/libuvc")
@@ -162,12 +181,14 @@ if(BUILD_TESTING)
   add_executable(uvc_negotiation_assertions tests/negotiation_assertions.c)
   add_executable(uvc_transfer_assertions tests/transfer_assertions.c)
   add_executable(uvc_teardown_assertions tests/teardown_assertions.c)
+  add_executable(uvc_status_race_assertions tests/status_race_assertions.c)
 
   foreach(test_target
       uvc_descriptor_assertions
       uvc_negotiation_assertions
       uvc_transfer_assertions
-      uvc_teardown_assertions)
+      uvc_teardown_assertions
+      uvc_status_race_assertions)
     target_link_libraries(${test_target}
       PRIVATE uvc_static LibUSB::LibUSB ${threads})
     if(JPEG_FOUND)
@@ -184,6 +205,10 @@ if(BUILD_TESTING)
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_free_transfer -Wl,--wrap=free")
   set_property(TARGET uvc_teardown_assertions APPEND_STRING
     PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_cancel_transfer -Wl,--wrap=libusb_release_interface -Wl,--wrap=libusb_attach_kernel_driver -Wl,--wrap=libusb_set_interface_alt_setting -Wl,--wrap=libusb_close -Wl,--wrap=libusb_unref_device -Wl,--wrap=nanosleep")
+  # nanosleep is deliberately NOT wrapped here: the race case needs uvc_close()'s
+  # bounded drain to really sleep so the event thread really interleaves with it.
+  set_property(TARGET uvc_status_race_assertions APPEND_STRING
+    PROPERTY LINK_FLAGS " -Wl,--wrap=libusb_submit_transfer -Wl,--wrap=libusb_cancel_transfer -Wl,--wrap=libusb_release_interface -Wl,--wrap=libusb_attach_kernel_driver -Wl,--wrap=libusb_set_interface_alt_setting -Wl,--wrap=libusb_close -Wl,--wrap=libusb_unref_device")
 
   foreach(case_name
       h264
@@ -216,6 +241,9 @@ if(BUILD_TESTING)
       status_xfer_stops_before_control_release
       every_claimed_interface_released_control_last
       no_status_endpoint_unchanged
+      sparse_interfaces_control_released_last
+      high_index_interfaces_released
+      cancel_not_found_still_drains
       undeliverable_status_xfer_quarantines)
     add_test(NAME libuvc.teardown.${case_name}
       COMMAND uvc_teardown_assertions --case ${case_name})
@@ -223,6 +251,13 @@ if(BUILD_TESTING)
   set_tests_properties(
     libuvc.teardown.undeliverable_status_xfer_quarantines
     PROPERTIES TIMEOUT 5)
+
+  add_test(NAME libuvc.race.close_races_status_callback
+    COMMAND uvc_status_race_assertions --case close_races_status_callback)
+  # Generous because the case is deliberately iterated, and a sanitized build
+  # multiplies that; a hang here means the drain deadlocked, not that it is slow.
+  set_tests_properties(libuvc.race.close_races_status_callback
+    PROPERTIES TIMEOUT 180)
 endif()
 
 if(BUILD_EXAMPLE)

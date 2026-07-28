@@ -129,8 +129,12 @@ jobs:
               "libuvc.teardown.status_xfer_stops_before_control_release",
               "libuvc.teardown.every_claimed_interface_released_control_last",
               "libuvc.teardown.no_status_endpoint_unchanged",
-              "libuvc.teardown.undeliverable_status_xfer_quarantines"
-            ] | sort) and (.tests | length == 23)
+              "libuvc.teardown.sparse_interfaces_control_released_last",
+              "libuvc.teardown.high_index_interfaces_released",
+              "libuvc.teardown.cancel_not_found_still_drains",
+              "libuvc.teardown.undeliverable_status_xfer_quarantines",
+              "libuvc.race.close_races_status_callback"
+            ] | sort) and (.tests | length == 27)
           ' "$result_dir/inventory.json" \
             2>&1 | tee "$result_dir/inventory-check.log"
 
@@ -179,3 +183,57 @@ jobs:
       - name: Enforce ccache bound
         if: ${{ always() }}
         run: ccache -c
+
+  # The teardown path hands a device handle between the closing thread and the
+  # libusb event thread, so the ordering assertions above cannot see a missing
+  # happens-before edge on their own -- only an instrumented run can. This job is
+  # what makes libuvc.race.close_races_status_callback a proof rather than a
+  # stress test; TSan works from vector clocks, so it fails on unsynchronized
+  # accesses even when they never overlap in wall-clock time.
+  thread-sanitizer:
+    name: ThreadSanitizer (teardown + race)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential cmake pkg-config libusb-1.0-0-dev libjpeg-dev
+
+      - name: Configure with -fsanitize=thread
+        run: |
+          cmake -S . -B build/tsan \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TARGET=Static \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_TEST=OFF \
+            -DBUILD_TESTING=ON \
+            -DLIBUVC_SANITIZE=thread
+
+      - name: Build
+        run: cmake --build build/tsan --parallel
+
+      # Scoped to the concurrent teardown cases on purpose: the descriptor,
+      # negotiation and transfer suites --wrap free(), which a sanitized build
+      # replaces, so routing those calls back to __real_free would report a
+      # mismatched allocator rather than anything about this code.
+      - name: Run teardown and race cases under TSan
+        run: |
+          ctest --test-dir build/tsan --output-on-failure \
+            -R 'libuvc\.(teardown|race)\.'
+
+      - name: Fail on any ThreadSanitizer report
+        run: |
+          set -o pipefail
+          ./build/tsan/uvc_status_race_assertions \
+            --case close_races_status_callback 2>&1 | tee tsan.log
+          if grep -q "ThreadSanitizer" tsan.log; then
+            echo "FAIL: ThreadSanitizer reported a problem in the close/callback race"
+            exit 1
+          fi
+          echo "PASS: no ThreadSanitizer reports"

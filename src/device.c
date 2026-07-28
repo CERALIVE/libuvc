@@ -391,18 +391,26 @@ static uvc_error_t uvc_open_internal(
                                    _uvc_status_callback,
                                    internal_devh,
                                    0);
+    /* Marked in-flight BEFORE the submit, and under the mutex, because the
+     * moment libusb accepts the transfer the event thread may run the callback
+     * to completion -- including clearing this flag on a terminal status.
+     * Setting it afterwards would overwrite that clear with a stale 1 and leave
+     * a transfer libusb no longer owns looking permanently submitted. libusb
+     * itself is entered under status_mutex here for the same reason
+     * uvc_stop_status_xfer() does: one uniform lock order. */
+    pthread_mutex_lock(&internal_devh->status_mutex);
+    internal_devh->status_xfer_submitted = 1;
     ret = libusb_submit_transfer(internal_devh->status_xfer);
     UVC_DEBUG("libusb_submit_transfer() = %d", ret);
+    if (ret)
+      internal_devh->status_xfer_submitted = 0;
+    pthread_mutex_unlock(&internal_devh->status_mutex);
 
     if (ret) {
       fprintf(stderr,
               "uvc: device has a status interrupt endpoint, but unable to read from it\n");
       goto fail;
     }
-    /* libusb now owns the transfer, and _uvc_status_callback() re-arms it after
-     * every completion. uvc_close() MUST stop it before releasing the
-     * VideoControl interface it rides on -- see uvc_stop_status_xfer(). */
-    internal_devh->status_xfer_submitted = 1;
   }
 
   if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL
@@ -1827,14 +1835,23 @@ uvc_error_t uvc_parse_vs(
  * @pre Streaming must be stopped, and threads must have died
  */
 void uvc_free_devh(uvc_device_handle_t *devh) {
+  int submitted;
+
   UVC_ENTER();
 
   if (devh->info)
     uvc_free_device_info(devh->info);
 
   /* libusb forbids freeing a transfer it still owns. status_xfer_submitted is
-   * only still set on the quarantine path, which never reaches here. */
-  if (devh->status_xfer && !devh->status_xfer_submitted)
+   * only still set on the quarantine path, which never reaches here -- but it is
+   * read under status_mutex anyway, both because that is the flag's contract and
+   * because the acquire is what orders the event thread's last write to
+   * `status_xfer` before this free. */
+  pthread_mutex_lock(&devh->status_mutex);
+  submitted = devh->status_xfer_submitted;
+  pthread_mutex_unlock(&devh->status_mutex);
+
+  if (devh->status_xfer && !submitted)
     libusb_free_transfer(devh->status_xfer);
 
   pthread_mutex_destroy(&devh->status_mutex);
@@ -1866,12 +1883,20 @@ void uvc_free_devh(uvc_device_handle_t *devh) {
  * interrupt endpoint were affected, which is why it reproduced on one camera and
  * not another on the same board.
  *
+ * Returning 1 is a memory-ordering claim as much as a state claim: uvc_close()
+ * goes straight on to release interfaces, close the usbfs handle and free both
+ * `status_xfer` and `devh`, so the caller needs everything the event thread did
+ * inside _uvc_status_callback() to be ordered before that. Reading
+ * status_xfer_submitted under status_mutex is what supplies it -- the unlock in
+ * the callback and the lock here are a release/acquire pair. The flag was
+ * previously polled bare (`volatile`), which orders nothing across threads.
+ *
  * @return 1 when the transfer is confirmed no longer submitted, 0 on timeout.
  */
 static int uvc_stop_status_xfer(uvc_device_handle_t *devh) {
   struct timespec poll;
   int waited_ms;
-  int cancelled;
+  int submitted;
 
   if (!devh->status_xfer)
     return 1;
@@ -1883,29 +1908,37 @@ static int uvc_stop_status_xfer(uvc_device_handle_t *devh) {
    * outlive this call. */
   pthread_mutex_lock(&devh->status_mutex);
   devh->status_xfer_stopping = 1;
-  if (!devh->status_xfer_submitted) {
-    pthread_mutex_unlock(&devh->status_mutex);
-    return 1;
+  submitted = devh->status_xfer_submitted;
+  if (submitted) {
+    /* The return value is deliberately not used to shortcut the wait.
+     * LIBUSB_ERROR_NOT_FOUND is documented as "not in progress, already
+     * complete, OR ALREADY CANCELLED" -- and in that last case the completion
+     * callback has not run yet. Treating NOT_FOUND as "done" (as this did) hands
+     * uvc_close() a transfer whose cancellation is still pending, which libusb
+     * documents as undefined behaviour to free, and lets the callback dereference
+     * a devh that is already free()d. So _uvc_status_callback() is the only thing
+     * that ever clears status_xfer_submitted, and the wait below is the only way
+     * out; a callback that genuinely never arrives hits the bound and quarantines
+     * the handle, which is the safe outcome either way. */
+    libusb_cancel_transfer(devh->status_xfer);
   }
-  cancelled = libusb_cancel_transfer(devh->status_xfer) == LIBUSB_SUCCESS;
   pthread_mutex_unlock(&devh->status_mutex);
 
-  if (!cancelled) {
-    /* NOT_FOUND means libusb has already reaped it; the callback either ran
-     * under the lock above or will now observe status_xfer_stopping. */
-    devh->status_xfer_submitted = 0;
-    return 1;
-  }
-
+  /* The wait must NOT span the sleep holding status_mutex: the callback that
+   * clears the flag takes the same mutex, so a held lock would block the very
+   * completion this is waiting for and turn every cancellation into a timeout. */
   poll.tv_sec = 0;
   poll.tv_nsec = (long) LIBUVC_STATUS_STOP_POLL_MS * 1000000L;
   for (waited_ms = 0;
-       devh->status_xfer_submitted && waited_ms < LIBUVC_STATUS_STOP_TIMEOUT_MS;
+       submitted && waited_ms < LIBUVC_STATUS_STOP_TIMEOUT_MS;
        waited_ms += LIBUVC_STATUS_STOP_POLL_MS) {
     nanosleep(&poll, NULL);
+    pthread_mutex_lock(&devh->status_mutex);
+    submitted = devh->status_xfer_submitted;
+    pthread_mutex_unlock(&devh->status_mutex);
   }
 
-  return devh->status_xfer_submitted ? 0 : 1;
+  return submitted ? 0 : 1;
 }
 
 /** @internal
@@ -2208,7 +2241,14 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_CANCELLED:
   case LIBUSB_TRANSFER_NO_DEVICE:
     UVC_DEBUG("not processing/resubmitting, status = %d", transfer->status);
+    /* This is the completion uvc_stop_status_xfer()'s bounded wait is watching
+     * for -- a cancel lands here -- so the clear must go through status_mutex
+     * like every other access. The unlock is what publishes this thread's last
+     * touch of `transfer` and `devh` to the closing thread, which frees both as
+     * soon as it observes the flag. */
+    pthread_mutex_lock(&devh->status_mutex);
     devh->status_xfer_submitted = 0;
+    pthread_mutex_unlock(&devh->status_mutex);
     UVC_EXIT_VOID();
     return;
   case LIBUSB_TRANSFER_COMPLETED:

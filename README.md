@@ -64,29 +64,55 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       -DBUILD_TESTING=ON
     cmake --build build/regression --parallel
     ctest --test-dir build/regression --show-only=json-v1 \
-      | jq -e '.tests | length == 19'
+      | jq -e '.tests | length == 27'
     ctest --test-dir build/regression --output-on-failure
 
-The 23 cases are grouped as descriptor (11: `h264`, `h265`,
+The 27 cases are grouped as descriptor (11: `h264`, `h265`,
 `truncated_format`, `truncated_frame`, `degenerate_h26x`,
 `scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
 `scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
 negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
 `probe_get_error`), transfer (3: `terminal_statuses`, `retry_success`,
-`retry_failure`), and teardown (4: `status_xfer_stops_before_control_release`,
+`retry_failure`), teardown (7: `status_xfer_stops_before_control_release`,
 `every_claimed_interface_released_control_last`,
-`no_status_endpoint_unchanged`, `undeliverable_status_xfer_quarantines`).
+`no_status_endpoint_unchanged`, `sparse_interfaces_control_released_last`,
+`high_index_interfaces_released`, `cancel_not_found_still_drains`,
+`undeliverable_status_xfer_quarantines`), and race
+(1: `close_races_status_callback`).
 CI runs this suite without camera hardware on Ubuntu 22.04
 and Ubuntu 24.04. See
 `docs/evidence/uvc-camera-compat-stability.md` for its exact scope.
 
-Adjust the `jq` length assertion above to `23` when running it.
+### Sanitized builds
+
+`LIBUVC_SANITIZE` builds the library **and** the tests with a sanitizer —
+instrumenting only the test executable would miss the interesting code, since
+the teardown races live in `src/device.c` and run on the libusb event thread:
+
+    cmake -S . -B build/tsan \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_BUILD_TARGET=Static \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DBUILD_EXAMPLE=OFF \
+      -DBUILD_TEST=OFF \
+      -DBUILD_TESTING=ON \
+      -DLIBUVC_SANITIZE=thread
+    cmake --build build/tsan --parallel
+    ctest --test-dir build/tsan --output-on-failure -R 'libuvc\.(teardown|race)\.'
+
+`libuvc.race.close_races_status_callback` is the case this exists for: it drives
+`uvc_close()` against a real libusb event thread, and only an instrumented run
+can see a missing happens-before edge between them. Keep the `-R` filter — the
+descriptor, negotiation and transfer suites `--wrap` `free()`, which a sanitized
+build replaces, so including them reports a mismatched allocator rather than
+anything about this code. A dedicated CI job runs exactly this.
 
 ### Device teardown contract
 
-`uvc_close()` owns the whole USB teardown and must keep two invariants that are
-not visible from the call site — both are regression-locked by the
-`libuvc.teardown.*` cases:
+`uvc_close()` owns the whole USB teardown and must keep four invariants that are
+not visible from the call site — all regression-locked by the
+`libuvc.teardown.*` and `libuvc.race.*` cases:
 
 1. **The VideoControl status interrupt transfer is stopped before any interface
    is released.** It re-arms itself from `_uvc_status_callback()`, so a
@@ -99,6 +125,22 @@ not visible from the call site — both are regression-locked by the
    failed negotiation can leave the streaming interface claimed, and reattaching
    the driver to VideoControl is what triggers `uvcvideo`'s probe — a probe that
    claims the streaming interfaces itself, so it must run after they are free.
+   The order is derived from `devh->claimed` and
+   `info->ctrl_if.bInterfaceNumber`, never assumed: a UVC function may sit at any
+   interface index and expose several VideoStreaming interfaces.
+3. **`status_xfer_submitted` and `status_xfer_stopping` are read and written
+   ONLY under `status_mutex`, on both threads.** They are shared between the
+   closing thread and the libusb event thread. `volatile` (what they used to be)
+   gives neither atomicity nor a happens-before edge, so the close could observe
+   the transfer "done" and free it — and the handle — while the callback was
+   still inside both. The mutex's unlock/lock pair is what orders the callback's
+   last write before the free.
+4. **A cancel reporting `LIBUSB_ERROR_NOT_FOUND` is still waited out.** libusb
+   documents that code as *"not in progress, already complete, or already
+   cancelled"*, and in the last of those the completion callback has not run yet;
+   freeing the transfer there is undefined behaviour by libusb's own contract.
+   `_uvc_status_callback()` is therefore the only thing that ever clears
+   `status_xfer_submitted`, and the bounded drain is the only way out of the stop.
 
 ## Developing with libuvc
 
