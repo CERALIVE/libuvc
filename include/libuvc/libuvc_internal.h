@@ -14,6 +14,7 @@
 #include <time.h>
 #include <libusb.h>
 #include "utlist.h"
+#include "libuvc/reattach_guard.h"
 
 /** Converts an unaligned four-byte little-endian integer into an int32 */
 #define DW_TO_INT(p) ((p)[0] | ((p)[1] << 8) | ((p)[2] << 16) | ((p)[3] << 24))
@@ -399,6 +400,15 @@ struct uvc_device_handle {
    * still owned by libusb. Quarantines the handle for the same reason
    * has_quarantined_stream does: a late callback dereferences devh. */
   uint8_t has_quarantined_status_xfer;
+  /** Out-of-process backstop that hands the kernel driver back for every
+   * interface this handle still holds, however the process ends -- including
+   * the exits that run no user code at all (SIGKILL, SIGSEGV, the watchdog's
+   * SIGABRT) and the quarantine paths above, which deliberately never release
+   * anything. Created lazily by uvc_claim_if() and released by uvc_free_devh(),
+   * i.e. only where the handle is genuinely freed. NULL when the guard is
+   * compiled out or could not be started; every entry point tolerates that.
+   * See reattach_guard.h. */
+  uvc_reattach_guard_t *reattach_guard;
 };
 
 /** Context within which we communicate with devices */

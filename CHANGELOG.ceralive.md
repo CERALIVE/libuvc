@@ -15,6 +15,54 @@ the upstream history, see `changelog.txt`.
 
 ## Unreleased
 
+### Added
+
+- **A kernel-driver reattach that survives an exit running no user code.**
+  Every earlier fix in this file hardens a path inside `uvc_close()`. A holder
+  killed with `SIGKILL` — or `SIGSEGV`, or the systemd watchdog's `SIGABRT` —
+  executes none of them, and the kernel does not re-probe a UVC interface when
+  usbfs's claim is dropped at fd-close, so both interfaces stay at
+  `driver = NONE` indefinitely and only a manual `uvcvideo/bind` or a USB
+  unbind/bind recovers the camera. Measured on an RK3588 board with a DJI Osmo
+  Pocket 3: 10 kills across three unrelated holder processes, 10 wedges, none
+  self-recovering; the same processes stopped with `SIGTERM`, which lets
+  `uvc_close()` run, recovered 3/3.
+
+  Nothing inside the dying process can fix that, because the defining property
+  of the failure is that the dying process runs nothing. So the reattach now
+  happens outside it. `uvc_claim_if()` forks a helper on the first claim
+  (double-forked, so it is reparented to init and the host is never handed a
+  `SIGCHLD` it did not ask for) and keeps the write end of a pipe. The helper
+  waits for that pipe's EOF — which the kernel delivers when the last write end
+  closes, and the kernel closes a dying process's descriptors unconditionally —
+  then reopens the device by its usbfs path, checks it is still the same device
+  (bus addresses are reused), and issues the `USBDEVFS_CONNECT` that
+  `libusb_attach_kernel_driver()` would have issued, retrying while the kernel
+  answers `EBUSY` because the helper wakes while the dead process's descriptors
+  are still being torn down.
+
+  A normal teardown disarms each interface as it hands the driver back, so the
+  helper wakes with nothing to do. The guard is a backstop, not a second
+  teardown path.
+
+  It is also what makes the quarantine paths whole. A quarantining `uvc_close()`
+  cannot release anything — libusb still owns a URB on the interface, and
+  releasing it either re-creates the usbfs-eviction defect below or makes
+  `uvcvideo` probe with the streaming interfaces still held and register no
+  video node. It therefore leaves the guard armed and undestroyed, which turns
+  the quarantine from a permanently wedged camera into a leak bounded by the
+  process lifetime.
+
+  Fail-safe by construction: the helper holds no reference to the device while
+  it waits, so a helper that dies leaves behaviour exactly as it was before this
+  change, never worse. Linux-only, and configurable:
+
+      cmake .. -DLIBUVC_REATTACH_GUARD=OFF
+
+  Six new regression cases cover it, five of which really do `SIGKILL` a forked
+  victim, since a test that calls a cleanup function proves nothing here. CI
+  builds and tests the `OFF` variant too.
+
 ### Fixed
 
 - **`uvc_close()` left the camera's kernel driver detached, so `/dev/videoN`
