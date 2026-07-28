@@ -65,6 +65,63 @@ the upstream history, see `changelog.txt`.
   (`libuvc.teardown.*`) that `--wrap` the libusb entry points into an ordered
   operation log and drive the real `uvc_close()`.
 
+- **Data race and use-after-free in the teardown fix above.** The stop path was
+  correct in shape but not actually synchronized, and both defects are on the
+  same `uvc_close()` the entry above added:
+
+  1. **`status_xfer_submitted` was shared across threads as bare `volatile`.**
+     It is written by `_uvc_status_callback()` on the libusb event thread and
+     read by `uvc_stop_status_xfer()` on the closing thread. Three of those
+     accesses sat outside `status_mutex`: the callback's terminal-status clear,
+     the closing thread's poll loop, and `uvc_free_devh()`'s check. `volatile`
+     supplies neither atomicity nor any happens-before edge — C classifies the
+     concurrent accesses as a data race outright, and on the weakly-ordered
+     aarch64 this fork ships on, the closing thread can observe the flag clear
+     while the callback's earlier stores are still invisible, then free both the
+     transfer and the handle out from under it. Every read and write of
+     `status_xfer_submitted` and `status_xfer_stopping` is now made holding
+     `status_mutex`, and both lost their misleading `volatile`. The bounded drain
+     takes and drops the mutex per iteration rather than spanning its sleep;
+     holding it would block the very callback it waits for. The flag is also set
+     BEFORE `libusb_submit_transfer()` in `uvc_open_internal()` instead of after,
+     so a callback that completes while the opening thread is still between the
+     two statements can no longer have its clear overwritten with a stale 1.
+
+  2. **A cancel returning `LIBUSB_ERROR_NOT_FOUND` was treated as drained.**
+     libusb documents that code as *"not in progress, already complete, **or
+     already cancelled**"* — and in the last case the completion callback has not
+     run yet. `uvc_stop_status_xfer()` returned success immediately, so
+     `uvc_close()` went on to release the interface, free a transfer whose
+     cancellation was still pending (undefined behaviour by libusb's own
+     contract) and free the `devh` that the pending callback dereferences.
+     `_uvc_status_callback()` is now the only thing that clears
+     `status_xfer_submitted`, and the existing bounded wait plus quarantine is
+     the only exit — so a callback that never arrives degrades to the safe,
+     already-designed leak instead of a use-after-free.
+
+  No deadlock is introduced. The lock order is uniform and one-way —
+  `status_mutex` first, libusb entry points under it, never the reverse — and
+  libusb invokes transfer callbacks from its event-handling thread with no
+  internal transfer lock held, with cancellation documented as asynchronous, so
+  there is no path back into `status_mutex` from inside libusb.
+
+  Covered by a new `libuvc.race.close_races_status_callback` case that drives the
+  real `uvc_close()` against a real libusb event thread over repeated iterations,
+  by `libuvc.teardown.cancel_not_found_still_drains`, and by a new
+  `LIBUVC_SANITIZE` CMake option with a CI job that fails on any ThreadSanitizer
+  report. On the pre-fix code TSan reports data races in `_uvc_status_callback()`
+  and `uvc_free_devh()`, a heap-use-after-free in `_uvc_status_callback()`, and a
+  destroy-of-a-locked-mutex in `uvc_free_devh()`.
+
+- **Teardown release order is now covered on a generic interface layout.** The
+  original cases all used VideoControl at interface 0 with at most one
+  VideoStreaming interface — the reproduction device's shape, which a release
+  loop that merely special-cased index 0 would also have satisfied.
+  `libuvc.teardown.sparse_interfaces_control_released_last` and
+  `libuvc.teardown.high_index_interfaces_released` drive a nonzero VideoControl
+  index with three scattered VideoStreaming interfaces, at low and high indices.
+  No production change; the existing logic was already generic.
+
 - **Reject inconsistent UVC descriptor lengths before parser dispatch.** The
   VideoControl and VideoStreaming descriptor scanners now return
   `UVC_ERROR_INVALID_DEVICE` for a declared length below the three-byte header

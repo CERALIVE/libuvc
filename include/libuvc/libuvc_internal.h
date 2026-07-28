@@ -346,26 +346,55 @@ struct uvc_device_handle {
    * device handle too, mirroring the stream-handle leak. Never cleared. */
   uint8_t has_quarantined_stream;
   /** Serializes _uvc_status_callback()'s decide-and-resubmit against
-   * uvc_stop_status_xfer()'s stop-and-cancel. Both flags below are read and
-   * written under it. Without the mutex the two interleave: the callback can
-   * read status_xfer_stopping as 0, lose the CPU, and issue its resubmission
-   * after uvc_stop_status_xfer() has already returned and uvc_close() has
-   * released the VideoControl interface -- the exact URB-after-release the stop
-   * exists to prevent. Initialized in uvc_open_internal(), destroyed in
-   * uvc_free_devh(). */
+   * uvc_stop_status_xfer()'s stop-and-cancel. Without the mutex the two
+   * interleave: the callback can read status_xfer_stopping as 0, lose the CPU,
+   * and issue its resubmission after uvc_stop_status_xfer() has already returned
+   * and uvc_close() has released the VideoControl interface -- the exact
+   * URB-after-release the stop exists to prevent.
+   *
+   * It is also the ONLY synchronization for the two flags below: EVERY read and
+   * EVERY write of either one, on either thread, is made holding this mutex.
+   * That is not bookkeeping tidiness -- it is what gives uvc_close() the
+   * happens-before edge it needs. Observing status_xfer_submitted == 0 through
+   * this mutex means the event thread's last touch of `status_xfer` and of this
+   * handle is ordered BEFORE the release/close/free that follows, because an
+   * unlock/lock pair is a release/acquire pair. A bare `volatile` flag (what
+   * this used to be) supplies neither atomicity nor that edge: C makes the
+   * concurrent accesses a data race outright, and on the weakly-ordered aarch64
+   * the fork actually ships on, the closing thread can see the flag clear while
+   * the callback's earlier stores are still invisible -- then free the transfer
+   * and the handle out from under it.
+   *
+   * The lock order is uniform and one-way: status_mutex is taken FIRST and libusb
+   * entry points are called under it, never the reverse. libusb invokes transfer
+   * callbacks with no internal transfer lock held and cancellation is
+   * asynchronous, so there is no path back into this mutex from inside libusb and
+   * no inversion to deadlock on. The bounded wait in uvc_stop_status_xfer() must
+   * therefore drop the mutex around its sleep -- holding it would block the very
+   * callback it waits for.
+   *
+   * Initialized in uvc_open_internal(), destroyed in uvc_free_devh(). */
   pthread_mutex_t status_mutex;
-  /** Non-zero while `status_xfer` is submitted to libusb -- set when
-   * uvc_open_internal() submits it, cleared by _uvc_status_callback() on the
-   * libusb event thread once the transfer is no longer resubmitted. Polled by
-   * uvc_stop_status_xfer() on the closing thread, hence `volatile`. */
-  volatile uint8_t status_xfer_submitted;
+  /** Non-zero while `status_xfer` is submitted to libusb -- set by
+   * uvc_open_internal() before it submits, cleared by _uvc_status_callback() on
+   * the libusb event thread once the transfer is no longer resubmitted. Polled
+   * by uvc_stop_status_xfer() on the closing thread. Guarded by status_mutex on
+   * every access; see there for why `volatile` was not enough.
+   *
+   * It is set BEFORE the submit, not after: the callback can run to completion on
+   * the event thread while the opening thread is still between the two
+   * statements, and a post-submit store would then overwrite the callback's clear
+   * with a stale 1, permanently marking a transfer libusb no longer owns as
+   * in-flight. */
+  uint8_t status_xfer_submitted;
   /** Set by uvc_stop_status_xfer() BEFORE it cancels `status_xfer`: tells
    * _uvc_status_callback() to stop resubmitting. Without it the callback keeps
    * re-arming the interrupt URB on the VideoControl interface AFTER uvc_close()
    * released that interface and reattached the kernel driver -- usbfs then logs
    * "did not claim interface N before use" and steals the interface back, so the
-   * final libusb_close() leaves it bound to no driver at all. Never cleared. */
-  volatile uint8_t status_xfer_stopping;
+   * final libusb_close() leaves it bound to no driver at all. Never cleared.
+   * Guarded by status_mutex on every access. */
+  uint8_t status_xfer_stopping;
   /** Set when uvc_stop_status_xfer()'s bounded wait expired with `status_xfer`
    * still owned by libusb. Quarantines the handle for the same reason
    * has_quarantined_stream does: a late callback dereferences devh. */

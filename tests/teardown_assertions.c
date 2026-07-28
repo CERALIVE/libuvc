@@ -38,6 +38,7 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer);
 typedef enum {
   OP_SUBMIT,
   OP_CANCEL,
+  OP_CALLBACK,
   OP_SETALT,
   OP_RELEASE,
   OP_ATTACH,
@@ -56,15 +57,17 @@ static int op_count;
 static int urb_in_flight;
 static int cancel_requested;
 static int deliver_callbacks;
+static int cancel_returns_not_found;
 
 static const char *op_name(op_kind kind) {
   switch (kind) {
-  case OP_SUBMIT:  return "submit";
-  case OP_CANCEL:  return "cancel";
-  case OP_SETALT:  return "set_alt";
-  case OP_RELEASE: return "release_if";
-  case OP_ATTACH:  return "attach_driver";
-  case OP_CLOSE:   return "close";
+  case OP_SUBMIT:   return "submit";
+  case OP_CANCEL:   return "cancel";
+  case OP_CALLBACK: return "status_callback";
+  case OP_SETALT:   return "set_alt";
+  case OP_RELEASE:  return "release_if";
+  case OP_ATTACH:   return "attach_driver";
+  case OP_CLOSE:    return "close";
   }
   return "?";
 }
@@ -88,6 +91,14 @@ static int index_of_first(op_kind kind, int iface) {
   int i;
   for (i = 0; i < op_count && i < MAX_OPS; i++)
     if (ops[i].kind == kind && ops[i].iface == iface)
+      return i;
+  return -1;
+}
+
+static int index_of_first_any(op_kind kind) {
+  int i;
+  for (i = 0; i < op_count && i < MAX_OPS; i++)
+    if (ops[i].kind == kind)
       return i;
   return -1;
 }
@@ -118,6 +129,7 @@ static void pump_event_thread(void) {
   urb_in_flight = 0;
   status_xfer->status = cancel_requested ? LIBUSB_TRANSFER_CANCELLED
                                          : LIBUSB_TRANSFER_TIMED_OUT;
+  record(OP_CALLBACK, -1);
   _uvc_status_callback(status_xfer);
 }
 
@@ -134,6 +146,11 @@ int __wrap_libusb_cancel_transfer(struct libusb_transfer *transfer) {
   if (!urb_in_flight)
     return LIBUSB_ERROR_NOT_FOUND;
   cancel_requested = 1;
+  /* "already cancelled" is one of the three things libusb reports as NOT_FOUND,
+   * and it is the one where the completion callback has NOT run yet. The URB
+   * therefore stays in flight here: the cancellation is pending, not finished. */
+  if (cancel_returns_not_found)
+    return LIBUSB_ERROR_NOT_FOUND;
   return LIBUSB_SUCCESS;
 }
 
@@ -183,9 +200,11 @@ static uvc_context_t ctx;
 static uvc_device_t dev;
 
 /* Build the handle uvc_open_internal() would have produced: `claimed` carries the
- * interfaces libuvc holds, and a non-zero control endpoint means the status
- * interrupt transfer was submitted and is self-re-arming. */
-static uvc_device_handle_t *make_handle(uint32_t claimed, uint8_t ctrl_endpoint) {
+ * interfaces libuvc holds, `ctrl_iface` is the VideoControl interface number, and
+ * a non-zero control endpoint means the status interrupt transfer was submitted
+ * and is self-re-arming. */
+static uvc_device_handle_t *make_handle_on(uint32_t claimed, uint8_t ctrl_endpoint,
+                                           uint8_t ctrl_iface) {
   uvc_device_handle_t *devh = calloc(1, sizeof(*devh));
   uvc_device_info_t *info = calloc(1, sizeof(*info));
 
@@ -204,7 +223,7 @@ static uvc_device_handle_t *make_handle(uint32_t claimed, uint8_t ctrl_endpoint)
    * this handle instead of killing and joining an event-handler thread. */
   ctx.own_usb_ctx = 0;
 
-  info->ctrl_if.bInterfaceNumber = 0;
+  info->ctrl_if.bInterfaceNumber = ctrl_iface;
   info->ctrl_if.bEndpointAddress = ctrl_endpoint;
 
   devh->dev = &dev;
@@ -215,6 +234,7 @@ static uvc_device_handle_t *make_handle(uint32_t claimed, uint8_t ctrl_endpoint)
   urb_in_flight = 0;
   cancel_requested = 0;
   deliver_callbacks = 1;
+  cancel_returns_not_found = 0;
   status_xfer = NULL;
 
   if (ctrl_endpoint) {
@@ -232,6 +252,10 @@ static uvc_device_handle_t *make_handle(uint32_t claimed, uint8_t ctrl_endpoint)
 
   DL_APPEND(ctx.open_devices, devh);
   return devh;
+}
+
+static uvc_device_handle_t *make_handle(uint32_t claimed, uint8_t ctrl_endpoint) {
+  return make_handle_on(claimed, ctrl_endpoint, 0);
 }
 
 /* A camera whose VideoControl interface carries a status interrupt endpoint. The
@@ -297,6 +321,86 @@ static int check_handle_without_status_endpoint_is_unchanged(void) {
   return EXIT_SUCCESS;
 }
 
+/* Both teardown invariants over an ARBITRARY interface layout. The two cases
+ * above pin the reproduction device's shape -- VideoControl at interface 0 with
+ * at most one VideoStreaming interface next to it -- which a release loop that
+ * simply special-cased index 0 would also satisfy. A UVC function may sit
+ * anywhere in a configuration's interface space and expose several
+ * VideoStreaming interfaces, so the order has to come from devh->claimed and
+ * info->ctrl_if.bInterfaceNumber and nothing else. */
+static int check_generic_layout(int ctrl_iface, const int *stream_ifaces,
+                                int stream_count, uint8_t ctrl_endpoint) {
+  uint32_t claimed = 1u << ctrl_iface;
+  uvc_device_handle_t *devh;
+  int release_ctrl, i;
+
+  for (i = 0; i < stream_count; i++)
+    claimed |= 1u << stream_ifaces[i];
+
+  devh = make_handle_on(claimed, ctrl_endpoint, (uint8_t) ctrl_iface);
+  CHECK(devh != NULL);
+  uvc_close(devh);
+
+  release_ctrl = index_of_first(OP_RELEASE, ctrl_iface);
+  CHECK(release_ctrl >= 0);
+  CHECK(count_of(OP_RELEASE) == stream_count + 1);
+
+  for (i = 0; i < stream_count; i++) {
+    int release_stream = index_of_first(OP_RELEASE, stream_ifaces[i]);
+    CHECK(release_stream >= 0);
+    CHECK(release_stream < release_ctrl);
+    CHECK(index_of_first(OP_ATTACH, stream_ifaces[i]) > release_stream);
+  }
+
+  CHECK(index_of_first(OP_ATTACH, ctrl_iface) > release_ctrl);
+  CHECK(index_of_last(OP_SUBMIT) < index_of_first_any(OP_RELEASE));
+  CHECK(index_of_last(OP_CLOSE) == op_count - 1);
+  return EXIT_SUCCESS;
+}
+
+/* VideoControl at a nonzero index, three VideoStreaming interfaces around it,
+ * and a status interrupt endpoint -- so the status stop and the release order
+ * are both exercised on a layout nothing in the fix can have been tuned to. */
+static int check_sparse_interfaces_control_released_last(void) {
+  static const int stream_ifaces[] = { 1, 5, 7 };
+  return check_generic_layout(3, stream_ifaces, 3, 0x83);
+}
+
+/* The same contract far away from the low bits the reproduction used, which is
+ * where a release scan that stopped early or assumed contiguity would show up.
+ * No status endpoint here, so this isolates the interface walk itself. */
+static int check_high_index_interfaces_released(void) {
+  static const int stream_ifaces[] = { 9, 17, 24 };
+  return check_generic_layout(2, stream_ifaces, 3, 0);
+}
+
+/* A cancel that reports LIBUSB_ERROR_NOT_FOUND must still be waited out. libusb
+ * documents that code as "not in progress, already complete, OR ALREADY
+ * CANCELLED", and in the last of those the completion callback has not run yet:
+ * the close would go on to release the interface, free the transfer libusb is
+ * still about to complete (undefined behaviour by libusb's own contract) and
+ * free the devh that the pending callback dereferences. So the callback has to
+ * land BEFORE the first USB operation of the teardown, not somewhere in the
+ * middle of it. */
+static int check_cancel_not_found_still_drains(void) {
+  uvc_device_handle_t *devh = make_handle(1u << 0, 0x81);
+  int callback;
+
+  CHECK(devh != NULL);
+  cancel_returns_not_found = 1;
+  uvc_close(devh);
+
+  CHECK(count_of(OP_CANCEL) == 1);
+  callback = index_of_first_any(OP_CALLBACK);
+  CHECK(callback >= 0);
+  CHECK(callback < index_of_first_any(OP_SETALT));
+  CHECK(callback < index_of_first(OP_RELEASE, 0));
+  CHECK(count_of(OP_SUBMIT) == 0);
+  CHECK(count_of(OP_RELEASE) == 1);
+  CHECK(index_of_last(OP_CLOSE) == op_count - 1);
+  return EXIT_SUCCESS;
+}
+
 /* A wedged event thread must not hang the close, and must not let it free a
  * handle libusb still references through the transfer's user_data. */
 static int check_undeliverable_status_xfer_quarantines_the_handle(void) {
@@ -323,6 +427,12 @@ int main(int argc, char **argv) {
     return check_every_claimed_interface_is_released_control_last();
   if (strcmp(argv[2], "no_status_endpoint_unchanged") == 0)
     return check_handle_without_status_endpoint_is_unchanged();
+  if (strcmp(argv[2], "sparse_interfaces_control_released_last") == 0)
+    return check_sparse_interfaces_control_released_last();
+  if (strcmp(argv[2], "high_index_interfaces_released") == 0)
+    return check_high_index_interfaces_released();
+  if (strcmp(argv[2], "cancel_not_found_still_drains") == 0)
+    return check_cancel_not_found_still_drains();
   if (strcmp(argv[2], "undeliverable_status_xfer_quarantines") == 0)
     return check_undeliverable_status_xfer_quarantines_the_handle();
   fprintf(stderr, "unknown case: %s\n", argv[2]);
