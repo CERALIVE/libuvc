@@ -23,6 +23,21 @@ CeraLive changes on top of the base:
 
        cmake .. -DLIBUVC_AUTO_DETACH_KERNEL_DRIVER=OFF
 
+4. **Kernel-driver reattach that survives an uncatchable exit** — detaching a
+   driver is undone by a userspace call in the release path, so a process killed
+   with `SIGKILL`/`SIGSEGV`/`SIGABRT` never undoes it and leaves both UVC
+   interfaces with `driver = NONE` for good. libuvc now forks a small helper
+   when it first claims an interface; the helper's wakeup is the pipe EOF the
+   kernel delivers on the arming process's death, whatever killed it, and it
+   re-probes the interfaces that are still armed. Gated by the CMake option
+   **`LIBUVC_REATTACH_GUARD` (default `ON`, Linux only)**:
+
+       cmake .. -DLIBUVC_REATTACH_GUARD=OFF
+
+   See `include/libuvc/reattach_guard.h` for the mechanism and its fail-safe
+   properties, and "Device teardown contract" below for how it relates to
+   `uvc_close()`.
+
 The library remains **BSD-3-Clause**; see `LICENSE.txt`. CeraLive additions are
 also BSD-3-Clause. No license change.
 
@@ -64,21 +79,31 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       -DBUILD_TESTING=ON
     cmake --build build/regression --parallel
     ctest --test-dir build/regression --show-only=json-v1 \
-      | jq -e '.tests | length == 27'
+      | jq -e '.tests | length == 33'
     ctest --test-dir build/regression --output-on-failure
 
-The 27 cases are grouped as descriptor (11: `h264`, `h265`,
+The 33 cases are grouped as descriptor (11: `h264`, `h265`,
 `truncated_format`, `truncated_frame`, `degenerate_h26x`,
 `scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
 `scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
 negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
 `probe_get_error`), transfer (3: `terminal_statuses`, `retry_success`,
-`retry_failure`), teardown (7: `status_xfer_stops_before_control_release`,
+`retry_failure`), teardown (8: `status_xfer_stops_before_control_release`,
 `every_claimed_interface_released_control_last`,
 `no_status_endpoint_unchanged`, `sparse_interfaces_control_released_last`,
 `high_index_interfaces_released`, `cancel_not_found_still_drains`,
-`undeliverable_status_xfer_quarantines`), and race
+`undeliverable_status_xfer_quarantines`, `quarantined_handle_stays_armed`),
+reattach (5: `rebinds_after_sigkill`, `disarmed_interfaces_are_not_rebound`,
+`busy_interface_is_retried`, `connect_ioctl_is_what_libusb_would_issue`,
+`claiming_an_interface_arms_the_guard`), and race
 (1: `close_races_status_callback`).
+
+The six guard cases exist only when `LIBUVC_REATTACH_GUARD` is `ON`; with
+`-DLIBUVC_REATTACH_GUARD=OFF` the suite is the 27 cases that predate it, and CI
+runs that configuration too so a rollback stays a real rollback. The reattach
+cases really do `SIGKILL` a forked victim process — that is the point, since the
+defect is defined by cleanup code never running.
+
 CI runs this suite without camera hardware on Ubuntu 22.04
 and Ubuntu 24.04. See
 `docs/evidence/uvc-camera-compat-stability.md` for its exact scope.
@@ -99,7 +124,8 @@ the teardown races live in `src/device.c` and run on the libusb event thread:
       -DBUILD_TESTING=ON \
       -DLIBUVC_SANITIZE=thread
     cmake --build build/tsan --parallel
-    ctest --test-dir build/tsan --output-on-failure -R 'libuvc\.(teardown|race)\.'
+    ctest --test-dir build/tsan --output-on-failure \
+      -R 'libuvc\.(teardown|race|reattach)\.'
 
 `libuvc.race.close_races_status_callback` is the case this exists for: it drives
 `uvc_close()` against a real libusb event thread, and only an instrumented run
@@ -110,9 +136,9 @@ anything about this code. A dedicated CI job runs exactly this.
 
 ### Device teardown contract
 
-`uvc_close()` owns the whole USB teardown and must keep four invariants that are
+`uvc_close()` owns the whole USB teardown and must keep five invariants that are
 not visible from the call site — all regression-locked by the
-`libuvc.teardown.*` and `libuvc.race.*` cases:
+`libuvc.teardown.*`, `libuvc.reattach.*` and `libuvc.race.*` cases:
 
 1. **The VideoControl status interrupt transfer is stopped before any interface
    is released.** It re-arms itself from `_uvc_status_callback()`, so a
@@ -141,6 +167,28 @@ not visible from the call site — all regression-locked by the
    freeing the transfer there is undefined behaviour by libusb's own contract.
    `_uvc_status_callback()` is therefore the only thing that ever clears
    `status_xfer_submitted`, and the bounded drain is the only way out of the stop.
+5. **Every interface libuvc claims is handed back, on every exit — including the
+   ones where `uvc_close()` never runs.** Invariants 1–4 all assume the process
+   lives long enough to execute them; `SIGKILL`, `SIGSEGV` and a watchdog's
+   `SIGABRT` execute nothing at all, and the kernel does not re-probe an
+   interface when usbfs's claim is dropped at fd-close. `uvc_claim_if()`
+   therefore arms the interface with the reattach guard and `uvc_release_if()`
+   disarms it only once the driver is genuinely back; the guard's forked helper
+   does the rest from outside the process. `uvc_reattach_guard_destroy()` runs
+   from `uvc_free_devh()` — the one place the handle is truly released, and
+   reached from neither quarantine path.
+
+   **The quarantine paths deliberately reattach nothing, and must stay that
+   way.** With a quarantined status transfer libusb still owns a URB on the
+   VideoControl status endpoint, so releasing that interface re-creates
+   invariant 1's defect exactly; with a quarantined stream the in-flight URB
+   rides a VideoStreaming interface, so releasing VideoControl alone would make
+   `uvcvideo` probe while usbfs still holds the streaming interfaces and
+   register no video node at all (invariant 2, in reverse). Both leave the
+   handle armed and let the helper repair the binding once this process — and
+   the transfer it was racing — is gone. A quarantine is a leak bounded by the
+   process lifetime, not a wedged camera.
+   `libuvc.teardown.quarantined_handle_stays_armed` locks that down.
 
 ## Developing with libuvc
 

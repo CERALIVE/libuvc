@@ -419,6 +419,57 @@ static int check_undeliverable_status_xfer_quarantines_the_handle(void) {
   return EXIT_SUCCESS;
 }
 
+/* Nothing in this file may touch /dev: the guard's helper is only here to be
+ * inspected, never to act. */
+static int inert_open_device(const struct uvc_reattach_record *record) {
+  (void) record;
+  return -1;
+}
+
+static int inert_rebind(int fd, uint8_t interface_number) {
+  (void) fd;
+  (void) interface_number;
+  return 0;
+}
+
+static void inert_close_device(int fd) {
+  (void) fd;
+}
+
+static const uvc_reattach_backend_t inert_backend = {
+  inert_open_device,
+  inert_rebind,
+  inert_close_device
+};
+
+/* The quarantine branch releases nothing, on purpose: libusb still owns a URB
+ * on the VideoControl status endpoint, so handing the interface back here would
+ * let the next resubmission make usbfs evict the driver it was just given --
+ * the very defect the status stop exists to prevent. That leaves the interface
+ * detached for as long as this process lives, which is exactly the case the
+ * out-of-process backstop covers. So a quarantining close must leave the guard
+ * ARMED, and a future "tidy-up" that disarms or destroys it here would silently
+ * turn a process-lifetime leak back into a permanently wedged camera. */
+static int check_quarantined_handle_stays_armed(void) {
+  uvc_device_handle_t *devh = make_handle(1u << 0, 0x81);
+
+  CHECK(devh != NULL);
+
+  uvc_reattach_guard_set_backend(&inert_backend);
+  devh->reattach_guard = uvc_reattach_guard_create(1, 2, 0x1234, 0x5678, 0x0100);
+  CHECK(devh->reattach_guard != NULL);
+  uvc_reattach_guard_arm(devh->reattach_guard, 0);
+
+  deliver_callbacks = 0;
+  uvc_close(devh);
+
+  CHECK(devh->has_quarantined_status_xfer == 1);
+  CHECK(count_of(OP_RELEASE) == 0);
+  CHECK(count_of(OP_ATTACH) == 0);
+  CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == (1u << 0));
+  return EXIT_SUCCESS;
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 3 && strcmp(argv[1], "--case") == 0);
   if (strcmp(argv[2], "status_xfer_stops_before_control_release") == 0)
@@ -435,6 +486,8 @@ int main(int argc, char **argv) {
     return check_cancel_not_found_still_drains();
   if (strcmp(argv[2], "undeliverable_status_xfer_quarantines") == 0)
     return check_undeliverable_status_xfer_quarantines_the_handle();
+  if (strcmp(argv[2], "quarantined_handle_stays_armed") == 0)
+    return check_quarantined_handle_stays_armed();
   fprintf(stderr, "unknown case: %s\n", argv[2]);
   return EXIT_FAILURE;
 }

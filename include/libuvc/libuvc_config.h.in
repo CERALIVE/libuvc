@@ -21,4 +21,6 @@
 
 #cmakedefine01 LIBUVC_AUTO_DETACH_KERNEL_DRIVER
 
+#cmakedefine01 LIBUVC_REATTACH_GUARD
+
 #endif // !def(LIBUVC_CONFIG_H)

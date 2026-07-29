@@ -133,8 +133,14 @@ jobs:
               "libuvc.teardown.high_index_interfaces_released",
               "libuvc.teardown.cancel_not_found_still_drains",
               "libuvc.teardown.undeliverable_status_xfer_quarantines",
+              "libuvc.teardown.quarantined_handle_stays_armed",
+              "libuvc.reattach.rebinds_after_sigkill",
+              "libuvc.reattach.disarmed_interfaces_are_not_rebound",
+              "libuvc.reattach.busy_interface_is_retried",
+              "libuvc.reattach.connect_ioctl_is_what_libusb_would_issue",
+              "libuvc.reattach.claiming_an_interface_arms_the_guard",
               "libuvc.race.close_races_status_callback"
-            ] | sort) and (.tests | length == 27)
+            ] | sort) and (.tests | length == 33)
           ' "$result_dir/inventory.json" \
             2>&1 | tee "$result_dir/inventory-check.log"
 
@@ -169,6 +175,29 @@ jobs:
           cmake --build build-off --parallel
           echo "PASS: OFF variant builds cleanly"
 
+      - name: Configure + build + test (reattach guard OFF — rollback path)
+        run: |
+          set -o pipefail
+          cmake -S . -B build-noguard \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TARGET=Static \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_EXAMPLE=OFF \
+            -DBUILD_TEST=OFF \
+            -DBUILD_TESTING=ON \
+            -DLIBUVC_REATTACH_GUARD=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build-noguard --parallel
+          # The guard's own cases go with it; everything that predates it must
+          # still pass, so a rollback is a real rollback and not a smaller gate.
+          ctest --test-dir build-noguard --show-only=json-v1 \
+            | jq -e '(.tests | length == 27)
+                     and ([.tests[].name] | map(startswith("libuvc.reattach.")) | any | not)'
+          ctest --test-dir build-noguard --output-on-failure
+          echo "PASS: guard OFF variant builds and keeps the pre-guard suite green"
+
       - name: Verify artifacts
         run: |
           test -f build/libuvc.so
@@ -191,7 +220,7 @@ jobs:
   # stress test; TSan works from vector clocks, so it fails on unsynchronized
   # accesses even when they never overlap in wall-clock time.
   thread-sanitizer:
-    name: ThreadSanitizer (teardown + race)
+    name: ThreadSanitizer (teardown + race + reattach)
     runs-on: ubuntu-24.04
 
     steps:
@@ -222,10 +251,10 @@ jobs:
       # negotiation and transfer suites --wrap free(), which a sanitized build
       # replaces, so routing those calls back to __real_free would report a
       # mismatched allocator rather than anything about this code.
-      - name: Run teardown and race cases under TSan
+      - name: Run teardown, race and reattach cases under TSan
         run: |
           ctest --test-dir build/tsan --output-on-failure \
-            -R 'libuvc\.(teardown|race)\.'
+            -R 'libuvc\.(teardown|race|reattach)\.'
 
       - name: Fail on any ThreadSanitizer report
         run: |

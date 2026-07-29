@@ -1004,6 +1004,37 @@ void uvc_unref_device(uvc_device_t *dev) {
  * @param devh UVC device handle
  * @param idx UVC interface index
  */
+/** @internal
+ * @brief Put an interface under the out-of-process reattach backstop.
+ *
+ * Armed on the CLAIM rather than on a successful detach. Whether a driver was
+ * there to detach is not the question the backstop answers -- the question is
+ * whether this process is the reason the interface is not bound, and holding a
+ * usbfs claim makes that true either way. Arming an interface that had no
+ * driver costs one ioctl the kernel answers with "nothing to bind".
+ */
+static void uvc_arm_reattach_guard(uvc_device_handle_t *devh, int idx) {
+  if (devh->reattach_guard == NULL) {
+    struct libusb_device_descriptor desc;
+    libusb_device *dev = devh->dev ? devh->dev->usb_dev : NULL;
+
+    if (dev == NULL || libusb_get_device_descriptor(dev, &desc) != LIBUSB_SUCCESS)
+      return;
+
+    devh->reattach_guard = uvc_reattach_guard_create(
+        libusb_get_bus_number(dev), libusb_get_device_address(dev),
+        desc.idVendor, desc.idProduct, desc.bcdDevice);
+
+    if (devh->reattach_guard == NULL) {
+      UVC_DEBUG("no reattach guard for this device: an exit that skips "
+                "uvc_close() will leave interface %d with no kernel driver", idx);
+      return;
+    }
+  }
+
+  uvc_reattach_guard_arm(devh->reattach_guard, idx);
+}
+
 uvc_error_t uvc_claim_if(uvc_device_handle_t *devh, int idx) {
   int ret = UVC_SUCCESS;
 
@@ -1023,6 +1054,7 @@ uvc_error_t uvc_claim_if(uvc_device_handle_t *devh, int idx) {
     UVC_DEBUG("claiming interface %d", idx);
     if (!( ret = libusb_claim_interface(devh->usb_devh, idx))) {
       devh->claimed |= ( 1 << idx );
+      uvc_arm_reattach_guard(devh, idx);
     }
   } else {
     UVC_DEBUG("not claiming interface %d: unable to detach kernel driver (%s)",
@@ -1070,6 +1102,13 @@ uvc_error_t uvc_release_if(uvc_device_handle_t *devh, int idx) {
       UVC_DEBUG("error reattaching kernel driver to interface %d: %s",
                 idx, uvc_strerror(ret));
     }
+
+    /* Disarmed only on the outcomes that mean the kernel has the interface
+     * back. A hard reattach failure leaves it armed, so the backstop retries it
+     * once this process's usbfs handle -- and the claim the reattach lost to --
+     * is gone. */
+    if (ret == UVC_SUCCESS)
+      uvc_reattach_guard_disarm(devh->reattach_guard, idx);
   }
 
   UVC_EXIT(ret);
@@ -1856,6 +1895,13 @@ void uvc_free_devh(uvc_device_handle_t *devh) {
 
   pthread_mutex_destroy(&devh->status_mutex);
 
+  /* The one place the handle is genuinely gone -- reached from uvc_close()'s
+   * normal path and from uvc_open_internal()'s failure path, both of them after
+   * libusb_close(), and from neither quarantine path. So the helper wakes with
+   * this process's usbfs claims already dropped, and anything still armed is an
+   * interface the teardown could not hand back. */
+  uvc_reattach_guard_destroy(devh->reattach_guard);
+
   free(devh);
 
   UVC_EXIT_VOID();
@@ -2015,7 +2061,27 @@ void uvc_close(uvc_device_handle_t *devh) {
    * from re-visiting (double-freeing, or mis-detecting the "last device") this
    * quarantined handle. The same reasoning covers has_quarantined_status_xfer:
    * a status transfer libusb still owns has user_data -> THIS handle, so freeing
-   * or closing here would be the same use-after-free one indirection shorter. */
+   * or closing here would be the same use-after-free one indirection shorter.
+   *
+   * This branch also cannot hand the kernel driver back, and that is a property
+   * of the quarantine rather than an oversight. With a quarantined STATUS
+   * transfer, libusb still owns a URB on the VideoControl status endpoint:
+   * releasing that interface and reattaching the driver lets the next
+   * resubmission reach usbfs on an interface this process no longer claims,
+   * usbfs re-claims it and evicts the driver that was just handed back -- the
+   * exact defect uvc_stop_status_xfer() exists to prevent. With a quarantined
+   * STREAM, the in-flight URB rides a VideoStreaming interface, so that one
+   * cannot be released either; releasing VideoControl on its own is worse than
+   * doing nothing, because uvcvideo then probes the function while usbfs still
+   * holds the streaming interfaces, finds no streaming interface for the
+   * terminal and registers no video node at all.
+   *
+   * So the reattach has to happen after this process's usbfs handle is gone,
+   * which is when there is no longer a transfer to race. devh->reattach_guard
+   * is deliberately left armed and undestroyed here: the helper it forked wakes
+   * on this process's death, whenever and however that comes, and rebinds then.
+   * A quarantine is a leak bounded by the process lifetime, not a wedged
+   * camera. */
   if (devh->has_quarantined_stream || devh->has_quarantined_status_xfer) {
     UVC_DEBUG("device handle %p has a quarantined %s (bounded stop wait timed out "
               "with a transfer still in flight); quarantining the device handle "

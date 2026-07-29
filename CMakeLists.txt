@@ -29,6 +29,9 @@ option(ENABLE_UVC_DEBUGGING "Enable UVC debugging" OFF)
 option(LIBUVC_AUTO_DETACH_KERNEL_DRIVER
   "Auto-detach the kernel driver (e.g. uvcvideo) when claiming UVC interfaces (CeraLive)"
   ON)
+option(LIBUVC_REATTACH_GUARD
+  "Fork a helper that reattaches the kernel driver if this process dies without closing (Linux only, CeraLive)"
+  ON)
 set(LIBUVC_SANITIZE "" CACHE STRING
   "Sanitizer to build library and tests with: thread, address, or empty (CeraLive)")
 set_property(CACHE LIBUVC_SANITIZE PROPERTY STRINGS "" thread address)
@@ -59,6 +62,7 @@ set(SOURCES
   src/diag.c
   src/frame.c
   src/init.c
+  src/reattach_guard.c
   src/stream.c
   src/misc.c
 )
@@ -183,12 +187,21 @@ if(BUILD_TESTING)
   add_executable(uvc_teardown_assertions tests/teardown_assertions.c)
   add_executable(uvc_status_race_assertions tests/status_race_assertions.c)
 
-  foreach(test_target
-      uvc_descriptor_assertions
-      uvc_negotiation_assertions
-      uvc_transfer_assertions
-      uvc_teardown_assertions
-      uvc_status_race_assertions)
+  set(UVC_TEST_TARGETS
+    uvc_descriptor_assertions
+    uvc_negotiation_assertions
+    uvc_transfer_assertions
+    uvc_teardown_assertions
+    uvc_status_race_assertions)
+
+  # The backstop is Linux-only and can be configured out, so its cases only
+  # exist when it does.
+  if(LIBUVC_REATTACH_GUARD)
+    add_executable(uvc_reattach_guard_assertions tests/reattach_guard_assertions.c)
+    list(APPEND UVC_TEST_TARGETS uvc_reattach_guard_assertions)
+  endif()
+
+  foreach(test_target ${UVC_TEST_TARGETS})
     target_link_libraries(${test_target}
       PRIVATE uvc_static LibUSB::LibUSB ${threads})
     if(JPEG_FOUND)
@@ -251,6 +264,34 @@ if(BUILD_TESTING)
   set_tests_properties(
     libuvc.teardown.undeliverable_status_xfer_quarantines
     PROPERTIES TIMEOUT 5)
+
+  if(LIBUVC_REATTACH_GUARD)
+    # Asserts what a quarantining close leaves behind FOR the backstop, so it
+    # only means anything when the backstop is compiled in.
+    add_test(NAME libuvc.teardown.quarantined_handle_stays_armed
+      COMMAND uvc_teardown_assertions --case quarantined_handle_stays_armed)
+    set_tests_properties(libuvc.teardown.quarantined_handle_stays_armed
+      PROPERTIES TIMEOUT 5)
+
+    set_property(TARGET uvc_reattach_guard_assertions APPEND_STRING
+      PROPERTY LINK_FLAGS " -Wl,--wrap=ioctl -Wl,--wrap=libusb_detach_kernel_driver -Wl,--wrap=libusb_claim_interface -Wl,--wrap=libusb_release_interface -Wl,--wrap=libusb_set_interface_alt_setting -Wl,--wrap=libusb_attach_kernel_driver -Wl,--wrap=libusb_get_device_descriptor -Wl,--wrap=libusb_get_bus_number -Wl,--wrap=libusb_get_device_address")
+    foreach(case_name
+        rebinds_after_sigkill
+        disarmed_interfaces_are_not_rebound
+        busy_interface_is_retried
+        connect_ioctl_is_what_libusb_would_issue
+        claiming_an_interface_arms_the_guard)
+      add_test(NAME libuvc.reattach.${case_name}
+        COMMAND uvc_reattach_guard_assertions --case ${case_name})
+    endforeach()
+    # These wait on a forked helper rather than on anything they control, so the
+    # bound is the helper's settle budget plus slack, not the work itself.
+    set_tests_properties(
+      libuvc.reattach.rebinds_after_sigkill
+      libuvc.reattach.disarmed_interfaces_are_not_rebound
+      libuvc.reattach.busy_interface_is_retried
+      PROPERTIES TIMEOUT 30)
+  endif()
 
   add_test(NAME libuvc.race.close_races_status_callback
     COMMAND uvc_status_race_assertions --case close_races_status_callback)
