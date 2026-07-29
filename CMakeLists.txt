@@ -280,7 +280,10 @@ if(BUILD_TESTING)
         disarmed_interfaces_are_not_rebound
         busy_interface_is_retried
         connect_ioctl_is_what_libusb_would_issue
-        claiming_an_interface_arms_the_guard)
+        claiming_an_interface_arms_the_guard
+        claim_failure_after_detach_reattaches
+        failed_reattach_after_failed_claim_stays_armed
+        detach_failure_leaves_nothing_armed)
       add_test(NAME libuvc.reattach.${case_name}
         COMMAND uvc_reattach_guard_assertions --case ${case_name})
     endforeach()

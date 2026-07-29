@@ -1,3 +1,5 @@
 # Build directory (recommended location)
 build/
+# The CI job's other configurations, reproduced locally under the same names.
+build-*/
 test-results/
