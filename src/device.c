@@ -1007,11 +1007,17 @@ void uvc_unref_device(uvc_device_t *dev) {
 /** @internal
  * @brief Put an interface under the out-of-process reattach backstop.
  *
- * Armed on the CLAIM rather than on a successful detach. Whether a driver was
- * there to detach is not the question the backstop answers -- the question is
- * whether this process is the reason the interface is not bound, and holding a
- * usbfs claim makes that true either way. Arming an interface that had no
- * driver costs one ioctl the kernel answers with "nothing to bind".
+ * Armed BEFORE the detach, not after the claim. Whether a driver was there to
+ * detach is not the question the backstop answers -- the question is whether
+ * this process is the reason the interface is not bound, and that becomes true
+ * the instant the detach ioctl lands, not when the claim returns. Arming an
+ * interface that had no driver costs one ioctl the kernel answers with "nothing
+ * to bind"; arming one this process turns out never to take is undone by the
+ * disarm on every path out of uvc_claim_if() that does not end in a claim.
+ *
+ * The guard is created lazily by the first arm, so this is also where the
+ * helper is forked -- now possibly for a claim that goes on to fail. The cost
+ * of that is one forked process that wakes to an empty armed set and exits.
  */
 static void uvc_arm_reattach_guard(uvc_device_handle_t *devh, int idx) {
   if (devh->reattach_guard == NULL) {
@@ -1037,6 +1043,7 @@ static void uvc_arm_reattach_guard(uvc_device_handle_t *devh, int idx) {
 
 uvc_error_t uvc_claim_if(uvc_device_handle_t *devh, int idx) {
   int ret = UVC_SUCCESS;
+  int reattach;
 
   UVC_ENTER();
 
@@ -1046,19 +1053,58 @@ uvc_error_t uvc_claim_if(uvc_device_handle_t *devh, int idx) {
     return ret;
   }
 
+  /* Armed before anything is taken away, because from here until the claim
+   * returns this process is what stands between the interface and its driver.
+   * Arming after the claim -- what this used to do -- left the whole detach and
+   * claim invisible to the backstop. */
+  uvc_arm_reattach_guard(devh, idx);
+
   /* Tell libusb to detach any active kernel drivers. libusb will keep track of whether
    * it found a kernel driver for this interface. */
   ret = libusb_detach_kernel_driver(devh->usb_devh, idx);
 
-  if (ret == UVC_SUCCESS || ret == LIBUSB_ERROR_NOT_FOUND || ret == LIBUSB_ERROR_NOT_SUPPORTED) {
-    UVC_DEBUG("claiming interface %d", idx);
-    if (!( ret = libusb_claim_interface(devh->usb_devh, idx))) {
-      devh->claimed |= ( 1 << idx );
-      uvc_arm_reattach_guard(devh, idx);
-    }
-  } else {
+  if (ret != UVC_SUCCESS && ret != LIBUSB_ERROR_NOT_FOUND
+      && ret != LIBUSB_ERROR_NOT_SUPPORTED) {
     UVC_DEBUG("not claiming interface %d: unable to detach kernel driver (%s)",
               idx, uvc_strerror(ret));
+    /* The driver is still exactly where it was, so there is nothing to hand
+     * back and nothing for the helper to repair. */
+    uvc_reattach_guard_disarm(devh->reattach_guard, idx);
+    UVC_EXIT(ret);
+    return ret;
+  }
+
+  UVC_DEBUG("claiming interface %d", idx);
+  ret = libusb_claim_interface(devh->usb_devh, idx);
+
+  if (ret == UVC_SUCCESS) {
+    devh->claimed |= ( 1 << idx );
+    UVC_EXIT(ret);
+    return ret;
+  }
+
+  /* The detach landed and the claim did not -- a busy device, a kernel racing
+   * the same interface -- so the interface is bound to nothing RIGHT NOW, in a
+   * process that is alive and well. Nothing comes back for it either:
+   * uvc_release_if() ignores an interface absent from devh->claimed, so without
+   * this the driver stays off for the rest of the process's life. Undo our own
+   * detach. */
+  reattach = libusb_attach_kernel_driver(devh->usb_devh, idx);
+
+  /* Disarmed only on the outcomes that mean the kernel has the interface back,
+   * exactly as uvc_release_if() does; a hard failure keeps it armed so the
+   * backstop retries once this process's usbfs handle is gone. The caller still
+   * gets the CLAIM's error -- what happened to the driver afterwards is this
+   * function's business, not the caller's. */
+  if (reattach == UVC_SUCCESS || reattach == LIBUSB_ERROR_NOT_FOUND
+      || reattach == LIBUSB_ERROR_NOT_SUPPORTED) {
+    uvc_reattach_guard_disarm(devh->reattach_guard, idx);
+    UVC_DEBUG("interface %d not claimed (%s); kernel driver handed back",
+              idx, uvc_strerror(ret));
+  } else {
+    UVC_DEBUG("interface %d not claimed (%s) and the kernel driver could not be "
+              "handed back (%s): left armed for the reattach backstop",
+              idx, uvc_strerror(ret), uvc_strerror(reattach));
   }
 
   UVC_EXIT(ret);

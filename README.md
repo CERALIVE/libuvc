@@ -79,10 +79,10 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       -DBUILD_TESTING=ON
     cmake --build build/regression --parallel
     ctest --test-dir build/regression --show-only=json-v1 \
-      | jq -e '.tests | length == 33'
+      | jq -e '.tests | length == 36'
     ctest --test-dir build/regression --output-on-failure
 
-The 33 cases are grouped as descriptor (11: `h264`, `h265`,
+The 36 cases are grouped as descriptor (11: `h264`, `h265`,
 `truncated_format`, `truncated_frame`, `degenerate_h26x`,
 `scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
 `scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
@@ -93,16 +93,20 @@ negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
 `no_status_endpoint_unchanged`, `sparse_interfaces_control_released_last`,
 `high_index_interfaces_released`, `cancel_not_found_still_drains`,
 `undeliverable_status_xfer_quarantines`, `quarantined_handle_stays_armed`),
-reattach (5: `rebinds_after_sigkill`, `disarmed_interfaces_are_not_rebound`,
+reattach (8: `rebinds_after_sigkill`, `disarmed_interfaces_are_not_rebound`,
 `busy_interface_is_retried`, `connect_ioctl_is_what_libusb_would_issue`,
-`claiming_an_interface_arms_the_guard`), and race
+`claiming_an_interface_arms_the_guard`, `claim_failure_after_detach_reattaches`,
+`failed_reattach_after_failed_claim_stays_armed`,
+`detach_failure_leaves_nothing_armed`), and race
 (1: `close_races_status_callback`).
 
-The six guard cases exist only when `LIBUVC_REATTACH_GUARD` is `ON`; with
+The nine guard cases exist only when `LIBUVC_REATTACH_GUARD` is `ON`; with
 `-DLIBUVC_REATTACH_GUARD=OFF` the suite is the 27 cases that predate it, and CI
-runs that configuration too so a rollback stays a real rollback. The reattach
-cases really do `SIGKILL` a forked victim process — that is the point, since the
-defect is defined by cleanup code never running.
+runs that configuration too so a rollback stays a real rollback. Three of the
+reattach cases really do `SIGKILL` a forked victim process — that is the point,
+since the defect is defined by cleanup code never running. The three claim-path
+cases need no kill at all: they cover a claim that fails in a process that stays
+alive, which is a different defect with the same symptom.
 
 CI runs this suite without camera hardware on Ubuntu 22.04
 and Ubuntu 24.04. See
@@ -172,11 +176,25 @@ not visible from the call site — all regression-locked by the
    lives long enough to execute them; `SIGKILL`, `SIGSEGV` and a watchdog's
    `SIGABRT` execute nothing at all, and the kernel does not re-probe an
    interface when usbfs's claim is dropped at fd-close. `uvc_claim_if()`
-   therefore arms the interface with the reattach guard and `uvc_release_if()`
-   disarms it only once the driver is genuinely back; the guard's forked helper
-   does the rest from outside the process. `uvc_reattach_guard_destroy()` runs
-   from `uvc_free_devh()` — the one place the handle is truly released, and
-   reached from neither quarantine path.
+   therefore arms the interface with the reattach guard **before it detaches the
+   driver**, and it is disarmed only where the driver is genuinely back — by
+   `uvc_release_if()` on a normal teardown, or by `uvc_claim_if()` itself on a
+   claim that never completed. The guard's forked helper does the rest from
+   outside the process. `uvc_reattach_guard_destroy()` runs from
+   `uvc_free_devh()` — the one place the handle is truly released, and reached
+   from neither quarantine path.
+
+   **A claim that fails after its detach succeeded undoes the detach on the
+   spot.** The detach and the claim are two kernel calls and only the first can
+   land: a busy device or a kernel racing the same interface fails the second,
+   and the interface is then bound to nothing in a process that is alive and
+   well. Nothing revisits it — `uvc_release_if()` skips any interface absent
+   from `devh->claimed` — so `uvc_claim_if()` issues the
+   `libusb_attach_kernel_driver()` itself and disarms only if that call reports
+   the kernel has the interface back. This is the one reattach that is not the
+   teardown's, and it is why arming happens at the detach rather than at the
+   claim: between those two calls there is a real interval in which this process
+   is the reason the interface has no driver.
 
    **The quarantine paths deliberately reattach nothing, and must stay that
    way.** With a quarantined status transfer libusb still owns a URB on the

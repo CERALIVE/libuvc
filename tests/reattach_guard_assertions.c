@@ -341,16 +341,57 @@ int __wrap_libusb_get_device_descriptor(libusb_device *device,
 uint8_t __wrap_libusb_get_bus_number(libusb_device *device);
 uint8_t __wrap_libusb_get_device_address(libusb_device *device);
 
+#define MAX_RECORDED_DETACHES 4
+
+/* The claim path's seam. A real device fails a claim only when something else
+ * is racing it, which is not something a test can ask for -- so the outcomes of
+ * detach, claim and attach are dictated here, and what libuvc did about them is
+ * recorded. */
+static int forced_detach_result = LIBUSB_SUCCESS;
+static int forced_claim_result = LIBUSB_SUCCESS;
+static int forced_attach_result = LIBUSB_SUCCESS;
+static unsigned int detach_calls;
+static unsigned int claim_calls;
+static unsigned int attach_calls;
+static int last_attached_interface = -1;
+/* Sampled at the moment the kernel driver is taken away: the ordering IS the
+ * fix, and nothing observable after the call returns can distinguish "armed
+ * before the detach" from "armed after the claim". */
+static uvc_device_handle_t *observed_devh;
+static int guard_existed_at_detach[MAX_RECORDED_DETACHES];
+static uint32_t armed_mask_at_detach[MAX_RECORDED_DETACHES];
+
+static void reset_claim_recording(void) {
+  forced_detach_result = LIBUSB_SUCCESS;
+  forced_claim_result = LIBUSB_SUCCESS;
+  forced_attach_result = LIBUSB_SUCCESS;
+  detach_calls = 0;
+  claim_calls = 0;
+  attach_calls = 0;
+  last_attached_interface = -1;
+  memset(guard_existed_at_detach, 0, sizeof(guard_existed_at_detach));
+  memset(armed_mask_at_detach, 0, sizeof(armed_mask_at_detach));
+}
+
 int __wrap_libusb_detach_kernel_driver(libusb_device_handle *handle, int idx) {
   (void) handle;
   (void) idx;
-  return LIBUSB_SUCCESS;
+
+  if (observed_devh != NULL && detach_calls < MAX_RECORDED_DETACHES) {
+    guard_existed_at_detach[detach_calls] = observed_devh->reattach_guard != NULL;
+    armed_mask_at_detach[detach_calls] =
+        uvc_reattach_guard_armed_mask(observed_devh->reattach_guard);
+  }
+  detach_calls++;
+  return forced_detach_result;
 }
 
 int __wrap_libusb_claim_interface(libusb_device_handle *handle, int idx) {
   (void) handle;
   (void) idx;
-  return LIBUSB_SUCCESS;
+
+  claim_calls++;
+  return forced_claim_result;
 }
 
 int __wrap_libusb_release_interface(libusb_device_handle *handle, int idx) {
@@ -369,8 +410,10 @@ int __wrap_libusb_set_interface_alt_setting(libusb_device_handle *handle,
 
 int __wrap_libusb_attach_kernel_driver(libusb_device_handle *handle, int idx) {
   (void) handle;
-  (void) idx;
-  return LIBUSB_SUCCESS;
+
+  attach_calls++;
+  last_attached_interface = idx;
+  return forced_attach_result;
 }
 
 int __wrap_libusb_get_device_descriptor(libusb_device *device,
@@ -404,6 +447,25 @@ static const uvc_reattach_backend_t inert_backend = {
   recording_close_device
 };
 
+/* Enough of a handle for uvc_claim_if()/uvc_release_if(): every libusb entry
+ * point they reach is --wrapped above, so none of this has to be real. */
+static uvc_device_handle_t *make_devh(uvc_context_t *ctx, uvc_device_t *dev) {
+  uvc_device_handle_t *devh = calloc(1, sizeof(*devh));
+
+  if (devh == NULL)
+    return NULL;
+
+  memset(ctx, 0, sizeof(*ctx));
+  memset(dev, 0, sizeof(*dev));
+  dev->ctx = ctx;
+  dev->usb_dev = (libusb_device *) dev;
+  devh->dev = dev;
+
+  reset_claim_recording();
+  observed_devh = devh;
+  return devh;
+}
+
 /* The cases above exercise the guard directly. This one exercises the wiring
  * that puts real interfaces under it: an interface enters the armed set at the
  * moment libuvc takes it from the kernel driver, and leaves only once libuvc
@@ -413,17 +475,13 @@ static const uvc_reattach_backend_t inert_backend = {
 static int check_claiming_an_interface_arms_the_guard(void) {
   static uvc_context_t ctx;
   static uvc_device_t dev;
-  uvc_device_handle_t *devh = calloc(1, sizeof(*devh));
+  uvc_device_handle_t *devh;
 
   CHECK(install_recorder(0));
   uvc_reattach_guard_set_backend(&inert_backend);
 
+  devh = make_devh(&ctx, &dev);
   CHECK(devh != NULL);
-  memset(&ctx, 0, sizeof(ctx));
-  memset(&dev, 0, sizeof(dev));
-  dev.ctx = &ctx;
-  dev.usb_dev = (libusb_device *) &dev;
-  devh->dev = &dev;
 
   CHECK(uvc_claim_if(devh, 1) == UVC_SUCCESS);
   CHECK(devh->reattach_guard != NULL);
@@ -433,10 +491,115 @@ static int check_claiming_an_interface_arms_the_guard(void) {
   CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard)
         == ((1u << 1) | (1u << 4)));
 
+  /* Armed BEFORE the driver is taken, not after the claim returns. Between
+   * those two moments the interface is already this process's responsibility --
+   * the detach can land and the claim still fail -- so a backstop that only
+   * learns about the interface afterwards cannot cover the interval in which it
+   * became driverless. */
+  CHECK(guard_existed_at_detach[0] == 1);
+  CHECK(armed_mask_at_detach[0] == (1u << 1));
+  CHECK(armed_mask_at_detach[1] == ((1u << 1) | (1u << 4)));
+
   CHECK(uvc_release_if(devh, 1) == UVC_SUCCESS);
   CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == (1u << 4));
 
   CHECK(uvc_release_if(devh, 4) == UVC_SUCCESS);
+  CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == 0);
+  return EXIT_SUCCESS;
+}
+
+/* THE case for a process that is alive and well. Detaching the kernel driver
+ * and claiming the interface are two separate kernel calls, and the first can
+ * succeed while the second fails -- a device that is busy, a kernel racing the
+ * same interface. The interface is then bound to nothing, and no later libuvc
+ * call comes back for it: uvc_release_if() skips anything absent from
+ * devh->claimed, so the driver stays off for the life of the process. Measured
+ * on hardware as 83 seconds of `1.0=usbfs, 1.1=NONE` with nothing killed.
+ * uvc_claim_if() has to undo its own detach. */
+static int check_claim_failure_after_detach_reattaches(void) {
+  static uvc_context_t ctx;
+  static uvc_device_t dev;
+  uvc_device_handle_t *devh;
+
+  CHECK(install_recorder(0));
+  uvc_reattach_guard_set_backend(&inert_backend);
+
+  devh = make_devh(&ctx, &dev);
+  CHECK(devh != NULL);
+  forced_claim_result = LIBUSB_ERROR_BUSY;
+
+  CHECK(uvc_claim_if(devh, 3) == UVC_ERROR_BUSY);
+  CHECK(detach_calls == 1);
+  CHECK(claim_calls == 1);
+  CHECK((devh->claimed & (1u << 3)) == 0);
+
+  /* The repair, in this process, now -- not after something dies. */
+  CHECK(attach_calls == 1);
+  CHECK(last_attached_interface == 3);
+
+  /* The guard is created by the arm itself, so its mere existence proves the
+   * interface was armed: before this fix a failed claim left this NULL. Reading
+   * it together with a zero mask separates "armed, then correctly disarmed once
+   * the driver was back" from "never armed at all", which the mask alone
+   * cannot. */
+  CHECK(devh->reattach_guard != NULL);
+  CHECK(guard_existed_at_detach[0] == 1);
+  CHECK(armed_mask_at_detach[0] == (1u << 3));
+  CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == 0);
+  return EXIT_SUCCESS;
+}
+
+/* The backstop half of the same failure. If handing the driver back fails too,
+ * the interface really is still driverless and this process cannot fix it --
+ * so it must stay armed and let the helper repair it once the usbfs handle is
+ * gone. Same rule uvc_release_if() already applies: disarm only on an outcome
+ * that means the kernel has the interface back. */
+static int check_failed_reattach_after_failed_claim_stays_armed(void) {
+  static uvc_context_t ctx;
+  static uvc_device_t dev;
+  uvc_device_handle_t *devh;
+
+  CHECK(install_recorder(0));
+  uvc_reattach_guard_set_backend(&inert_backend);
+
+  devh = make_devh(&ctx, &dev);
+  CHECK(devh != NULL);
+  forced_claim_result = LIBUSB_ERROR_BUSY;
+  forced_attach_result = LIBUSB_ERROR_NO_DEVICE;
+
+  /* The caller learns why the CLAIM failed. The reattach is bookkeeping behind
+   * its back and must not overwrite that answer. */
+  CHECK(uvc_claim_if(devh, 2) == UVC_ERROR_BUSY);
+  CHECK((devh->claimed & (1u << 2)) == 0);
+  CHECK(attach_calls == 1);
+  CHECK(last_attached_interface == 2);
+  CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == (1u << 2));
+  return EXIT_SUCCESS;
+}
+
+/* Arming before the detach means an interface can be armed that libuvc then
+ * never takes. A detach that fails leaves the kernel driver exactly where it
+ * was, so there is nothing to hand back and nothing for the helper to repair:
+ * the arm has to be rolled back, or every failed claim would leave the helper
+ * re-probing an interface someone else legitimately holds. */
+static int check_detach_failure_leaves_nothing_armed(void) {
+  static uvc_context_t ctx;
+  static uvc_device_t dev;
+  uvc_device_handle_t *devh;
+
+  CHECK(install_recorder(0));
+  uvc_reattach_guard_set_backend(&inert_backend);
+
+  devh = make_devh(&ctx, &dev);
+  CHECK(devh != NULL);
+  forced_detach_result = LIBUSB_ERROR_NO_DEVICE;
+
+  CHECK(uvc_claim_if(devh, 1) == UVC_ERROR_NO_DEVICE);
+  CHECK(detach_calls == 1);
+  /* Nothing was taken, so nothing was claimed and nothing was handed back. */
+  CHECK(claim_calls == 0);
+  CHECK(attach_calls == 0);
+  CHECK((devh->claimed & (1u << 1)) == 0);
   CHECK(uvc_reattach_guard_armed_mask(devh->reattach_guard) == 0);
   return EXIT_SUCCESS;
 }
@@ -453,6 +616,12 @@ int main(int argc, char **argv) {
     return check_connect_ioctl_is_what_libusb_would_issue();
   if (strcmp(argv[2], "claiming_an_interface_arms_the_guard") == 0)
     return check_claiming_an_interface_arms_the_guard();
+  if (strcmp(argv[2], "claim_failure_after_detach_reattaches") == 0)
+    return check_claim_failure_after_detach_reattaches();
+  if (strcmp(argv[2], "failed_reattach_after_failed_claim_stays_armed") == 0)
+    return check_failed_reattach_after_failed_claim_stays_armed();
+  if (strcmp(argv[2], "detach_failure_leaves_nothing_armed") == 0)
+    return check_detach_failure_leaves_nothing_armed();
   fprintf(stderr, "unknown case: %s\n", argv[2]);
   return EXIT_FAILURE;
 }

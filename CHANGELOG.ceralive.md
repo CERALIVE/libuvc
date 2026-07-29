@@ -59,11 +59,47 @@ the upstream history, see `changelog.txt`.
 
       cmake .. -DLIBUVC_REATTACH_GUARD=OFF
 
-  Six new regression cases cover it, five of which really do `SIGKILL` a forked
+  Nine regression cases cover it, three of which really do `SIGKILL` a forked
   victim, since a test that calls a cleanup function proves nothing here. CI
   builds and tests the `OFF` variant too.
 
 ### Fixed
+
+- **A failed interface claim left the interface with no kernel driver, in a
+  process that was alive and well.** `uvc_claim_if()` detaches the kernel driver
+  and claims the interface in two separate kernel calls, and rolled back
+  neither. A detach that succeeded followed by a claim that failed — a busy
+  device, a kernel racing the same interface — therefore left the interface
+  bound to nothing, and nothing came back for it: `uvc_release_if()` skips any
+  interface absent from `devh->claimed`, so the driver stayed off for the rest
+  of the process's life. No kill and no crash were involved. Measured on an
+  RK3588 board as a partial claim (`5-1:1.0=usbfs`, `5-1:1.1=NONE`) that
+  persisted **83 seconds** with nothing killed, ending in the watchdog cycle
+  that the reattach guard above exists to break.
+
+  The window is wider in practice than the code suggests, because the claims are
+  split across two moments: `uvc_open()` claims only the VideoControl interface,
+  and the VideoStreaming interface is claimed later, at stream negotiation.
+
+  `uvc_claim_if()` now undoes its own detach. A claim that fails is followed by
+  the `libusb_attach_kernel_driver()` the release path would have made, so the
+  interface is handed back immediately rather than at process exit. The caller
+  still receives the claim's error — what happened to the driver afterwards is
+  not the caller's business.
+
+  The backstop's arming moved with it. An interface is armed **before** the
+  detach instead of after a successful claim, because it is the detach, not the
+  claim, that makes this process the reason the interface is unbound. It is
+  disarmed again on every path out of `uvc_claim_if()` that does not end in a
+  claim: a detach that failed took nothing, and a claim that failed is only
+  disarmed once the driver is genuinely back — a hard reattach failure stays
+  armed so the helper repairs it once this process is gone. Same rule
+  `uvc_release_if()` already applied.
+
+  Three new regression cases lock it down, all reproducing the defect first.
+  With `LIBUVC_REATTACH_GUARD=OFF` the reattach on claim failure still runs; only
+  the arm/disarm bookkeeping compiles out, so the `OFF` build gets the repair
+  without the backstop.
 
 - **`uvc_close()` left the camera's kernel driver detached, so `/dev/videoN`
   never came back.** Two independent teardown defects, both reproduced on a
