@@ -29,7 +29,13 @@ CeraLive changes on top of the base:
    interfaces with `driver = NONE` for good. libuvc now forks a small helper
    when it first claims an interface; the helper's wakeup is the pipe EOF the
    kernel delivers on the arming process's death, whatever killed it, and it
-   re-probes the interfaces that are still armed. Gated by the CMake option
+   re-probes the interfaces that are still armed. That helper is created with a
+   raw `clone(2)`, not `fork()`: glibc's `fork()` runs every `pthread_atfork()`
+   handler registered anywhere in the process, so in a host that also links
+   libsrt the child ran SRT's handler and blocked forever on an SRT mutex a
+   now-vanished thread had held — never reaching the helper, and keeping every
+   descriptor the fork had copied until something `SIGKILL`ed it. Gated by the
+   CMake option
    **`LIBUVC_REATTACH_GUARD` (default `ON`, Linux only)**:
 
        cmake .. -DLIBUVC_REATTACH_GUARD=OFF
@@ -79,10 +85,10 @@ Linux CTest suite. Configure, build, inspect, and run its static build with:
       -DBUILD_TESTING=ON
     cmake --build build/regression --parallel
     ctest --test-dir build/regression --show-only=json-v1 \
-      | jq -e '.tests | length == 36'
+      | jq -e '.tests | length == 37'
     ctest --test-dir build/regression --output-on-failure
 
-The 36 cases are grouped as descriptor (11: `h264`, `h265`,
+The 37 cases are grouped as descriptor (11: `h264`, `h265`,
 `truncated_format`, `truncated_frame`, `degenerate_h26x`,
 `scanner_vc_header_short`, `scanner_vc_oversized`, `scanner_vc_zero`,
 `scanner_vs_header_short`, `scanner_vs_oversized`, `scanner_vs_zero`),
@@ -93,20 +99,24 @@ negotiation (5: `h264`, `h265`, `near_match`, `probe_set_error`,
 `no_status_endpoint_unchanged`, `sparse_interfaces_control_released_last`,
 `high_index_interfaces_released`, `cancel_not_found_still_drains`,
 `undeliverable_status_xfer_quarantines`, `quarantined_handle_stays_armed`),
-reattach (8: `rebinds_after_sigkill`, `disarmed_interfaces_are_not_rebound`,
-`busy_interface_is_retried`, `connect_ioctl_is_what_libusb_would_issue`,
+reattach (9: `rebinds_after_sigkill`, `disarmed_interfaces_are_not_rebound`,
+`busy_interface_is_retried`, `rebinds_despite_a_foreign_atfork_handler`,
+`connect_ioctl_is_what_libusb_would_issue`,
 `claiming_an_interface_arms_the_guard`, `claim_failure_after_detach_reattaches`,
 `failed_reattach_after_failed_claim_stays_armed`,
 `detach_failure_leaves_nothing_armed`), and race
 (1: `close_races_status_callback`).
 
-The nine guard cases exist only when `LIBUVC_REATTACH_GUARD` is `ON`; with
+The ten guard cases exist only when `LIBUVC_REATTACH_GUARD` is `ON`; with
 `-DLIBUVC_REATTACH_GUARD=OFF` the suite is the 27 cases that predate it, and CI
-runs that configuration too so a rollback stays a real rollback. Three of the
+runs that configuration too so a rollback stays a real rollback. Four of the
 reattach cases really do `SIGKILL` a forked victim process — that is the point,
-since the defect is defined by cleanup code never running. The three claim-path
-cases need no kill at all: they cover a claim that fails in a process that stays
-alive, which is a different defect with the same symptom.
+since the defect is defined by cleanup code never running. One of those four
+also registers a `pthread_atfork()` handler in the victim and holds its mutex
+hostage on a second thread, which is what a host linking libsrt does to the
+guard's own fork. The three claim-path cases need no kill at all: they cover a
+claim that fails in a process that stays alive, which is a different defect with
+the same symptom.
 
 CI runs this suite without camera hardware on Ubuntu 22.04
 and Ubuntu 24.04. See

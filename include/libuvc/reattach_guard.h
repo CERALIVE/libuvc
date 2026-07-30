@@ -17,7 +17,11 @@
  *
  *   - At the first successful interface claim, libuvc forks a tiny helper
  *     (double-forked, so it is reparented to init and the host never sees a
- *     SIGCHLD it did not ask for) and keeps the write end of a pipe.
+ *     SIGCHLD it did not ask for) and keeps the write end of a pipe. The fork is
+ *     issued as a raw clone(2), because glibc's fork() also runs every
+ *     pthread_atfork() handler ANY library in the process registered, and a
+ *     neighbour's handler taking one of its own mutexes wedges the child for
+ *     good -- see the comment on raw_fork() in reattach_guard.c.
  *   - The helper blocks on the read end. Its wakeup is the pipe's EOF, which the
  *     kernel delivers when the last write end closes -- and the kernel closes
  *     every descriptor of a dying process unconditionally, for _exit(), abort(),

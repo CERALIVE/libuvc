@@ -18,8 +18,10 @@
 #include <fcntl.h>
 #include <linux/usbdevice_fs.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -183,6 +185,38 @@ static void close_inherited_fds(int keep_fd, int scan_limit) {
   }
 }
 
+/* fork() -- the glibc function, not the kernel operation -- runs every handler
+ * ANY library in the process registered with pthread_atfork(), in the child, on
+ * every call, whoever called fork() and for whatever reason. libuvc is linked
+ * alongside libsrt in cerastream, and SRT's child handler
+ * (srt::CUDTUnited::cleanupAtFork) locks an SRT mutex. A fork carries only the
+ * calling thread into the child, so whenever another SRT thread happened to hold
+ * that mutex at the instant of this call, it was locked in the child with no
+ * thread left alive to release it. Confirmed on an RK3588 board: the child sat
+ * in pthread_mutex_lock() forever, never reached helper_main(), reattached
+ * nothing, and held every descriptor the fork had copied -- the usbfs node and
+ * the ALSA capture device among them -- until something SIGKILLed it.
+ *
+ * The kernel has no such notion: fork(2) is defined as clone(2) with flags of
+ * just SIGCHLD, and glibc's __run_fork_handlers() is reached only from the
+ * fork() wrapper. Issuing that clone directly is therefore the same process
+ * creation with none of the handlers. It also skips glibc's own post-fork
+ * repairs (malloc arenas, the loader lock), which costs nothing here: everything
+ * this child runs is post-fork code in a multi-threaded process and is already
+ * restricted to async-signal-safe calls that touch none of that state.
+ *
+ * A NULL stack is what keeps this a fork rather than a thread -- with CLONE_VM
+ * unset the kernel hands the child a copy-on-write duplicate of the caller's
+ * stack, exactly as for fork(). The three trailing arguments are the tid and TLS
+ * pointers, and their order genuinely differs between x86-64 and aarch64; that
+ * is moot only because none of CLONE_PARENT_SETTID, CLONE_CHILD_SETTID,
+ * CLONE_CHILD_CLEARTID or CLONE_SETTLS is set, so the kernel never reads them.
+ * Passing any of them non-NULL would make this architecture-dependent. */
+static pid_t raw_fork(void) {
+  /* flags, stack, and the three trailing pointers the flags above leave unread. */
+  return (pid_t) syscall(SYS_clone, (long) SIGCHLD, 0L, 0L, 0L, 0L);
+}
+
 static void helper_main(int notify_fd, int scan_limit,
                         const struct uvc_reattach_record *record) {
   char drain[64];
@@ -251,12 +285,12 @@ uvc_reattach_guard_t *uvc_reattach_guard_create(uint8_t busnum, uint8_t devnum,
 
   scan_limit = fd_scan_limit();
 
-  intermediate = fork();
+  intermediate = raw_fork();
   if (intermediate == 0) {
     /* Double fork: the helper is reparented to init, so the host is never
      * handed a SIGCHLD for a process it did not create and never has a zombie
      * it does not know to reap. */
-    if (fork() == 0)
+    if (raw_fork() == 0)
       helper_main(notify[0], scan_limit, record); /* does not return */
     _exit(0);
   }

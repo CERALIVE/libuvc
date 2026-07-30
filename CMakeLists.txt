@@ -279,6 +279,7 @@ if(BUILD_TESTING)
         rebinds_after_sigkill
         disarmed_interfaces_are_not_rebound
         busy_interface_is_retried
+        rebinds_despite_a_foreign_atfork_handler
         connect_ioctl_is_what_libusb_would_issue
         claiming_an_interface_arms_the_guard
         claim_failure_after_detach_reattaches
@@ -293,6 +294,7 @@ if(BUILD_TESTING)
       libuvc.reattach.rebinds_after_sigkill
       libuvc.reattach.disarmed_interfaces_are_not_rebound
       libuvc.reattach.busy_interface_is_retried
+      libuvc.reattach.rebinds_despite_a_foreign_atfork_handler
       PROPERTIES TIMEOUT 30)
   endif()
 
