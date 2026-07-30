@@ -59,11 +59,39 @@ the upstream history, see `changelog.txt`.
 
       cmake .. -DLIBUVC_REATTACH_GUARD=OFF
 
-  Nine regression cases cover it, three of which really do `SIGKILL` a forked
+  Ten regression cases cover it, four of which really do `SIGKILL` a forked
   victim, since a test that calls a cleanup function proves nothing here. CI
   builds and tests the `OFF` variant too.
 
 ### Fixed
+
+- **The reattach helper deadlocked at birth in any host that also registers a
+  `pthread_atfork()` handler.** glibc's `fork()` runs every fork handler
+  registered anywhere in the process, in the child, on every call — it does not
+  matter which library called `fork()` or why. `cerastream` links libuvc next to
+  libsrt, whose child handler (`srt::CUDTUnited::cleanupAtFork`) locks an SRT
+  mutex; a `fork()` carries only the calling thread into the child, so whenever
+  another SRT thread held that mutex at the instant of the guard's fork it was
+  locked in the child with no thread left alive to release it.
+
+  Captured by attaching gdb to a stuck child on an RK3588 board:
+  `pthread_mutex_lock` ← `srt::CUDT::closeInternal` ← `CUDTUnited::cleanupAllSockets`
+  ← `CUDTUnited::cleanupAtFork` ← `fork` ← `uvc_reattach_guard_create`, with
+  `strace` showing an untimed `FUTEX_WAIT_PRIVATE`. `helper_main()` never ran, so
+  nothing was reattached **and** nothing was closed: the child kept the ~99
+  descriptors the fork had copied — the usbfs node, the ALSA capture device, the
+  MPP encoder — and ignored every `SIGTERM`, so the next run found its audio
+  device busy and its camera taken. systemd logged `Found left-over process …
+  in control group while starting unit` on essentially every restart.
+
+  `uvc_reattach_guard_create()` now creates both processes with a raw `clone(2)`
+  system call. `fork(2)` is defined as `clone(2)` with flags of just `SIGCHLD`,
+  and glibc's `__run_fork_handlers()` is reached only from the `fork()` wrapper,
+  so this is the same process creation with none of the handlers. The double-fork
+  topology, the `waitpid()` handshake and everything `helper_main()` does are
+  unchanged. `libuvc.reattach.rebinds_despite_a_foreign_atfork_handler` locks it
+  down by registering exactly such a handler in the victim and holding its mutex
+  hostage on a second thread across the fork.
 
 - **A failed interface claim left the interface with no kernel driver, in a
   process that was alive and well.** `uvc_claim_if()` detaches the kernel driver

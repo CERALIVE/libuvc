@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <linux/usbdevice_fs.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -272,6 +273,133 @@ static int check_busy_interface_is_retried(void) {
   CHECK(recorder->rebind_calls == 4);
   CHECK(recorder->rebound_count == 1);
   CHECK(recorder->rebound[0] == 1);
+  return EXIT_SUCCESS;
+}
+
+/* Stands in for srt::CUDTUnited::cleanupAtFork(). The mutex is deliberately a
+ * plain process-private one: a fork() child gets it in whatever state it was in,
+ * and none of the threads that could unlock it. */
+static pthread_mutex_t hostage_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t hostage_taken_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hostage_taken = PTHREAD_COND_INITIALIZER;
+static int hostage_is_held;
+
+/* Takes the hostage and never gives it back, so the fork under test provably
+ * happens while another thread holds it -- the timing the board hit by luck. */
+static void *hold_hostage_forever(void *unused) {
+  (void) unused;
+
+  pthread_mutex_lock(&hostage_mutex);
+
+  pthread_mutex_lock(&hostage_taken_mutex);
+  hostage_is_held = 1;
+  pthread_cond_signal(&hostage_taken);
+  pthread_mutex_unlock(&hostage_taken_mutex);
+
+  for (;;)
+    pause();
+  return NULL;
+}
+
+static void child_handler_that_wedges_a_fork(void) {
+  pthread_mutex_lock(&hostage_mutex);
+  pthread_mutex_unlock(&hostage_mutex);
+}
+
+/* Same shape as run_victim_then_sigkill(), with two differences that matter.
+ *
+ * The hostage thread and the handler are installed INSIDE the victim: a handler
+ * registered before this fork would wedge the victim itself, and the claim under
+ * test is about the fork libuvc performs, not this one.
+ *
+ * The wait is bounded. Before the fix the victim never reaches its own
+ * raise(SIGKILL) at all -- it sits in uvc_reattach_guard_create()'s waitpid()
+ * for an intermediate that is wedged in the handler -- so an unbounded wait
+ * would hang the suite where it should fail it. */
+static int run_atfork_hostile_victim_then_sigkill(void) {
+  pid_t victim = fork();
+  pid_t reaped = 0;
+  int status = 0;
+  int waited;
+
+  if (victim == 0) {
+    pthread_t holder;
+    uvc_reattach_guard_t *guard;
+
+    if (pthread_create(&holder, NULL, hold_hostage_forever, NULL) != 0)
+      _exit(4);
+
+    pthread_mutex_lock(&hostage_taken_mutex);
+    while (!hostage_is_held)
+      pthread_cond_wait(&hostage_taken, &hostage_taken_mutex);
+    pthread_mutex_unlock(&hostage_taken_mutex);
+
+    if (pthread_atfork(NULL, NULL, child_handler_that_wedges_a_fork) != 0)
+      _exit(5);
+
+    guard = uvc_reattach_guard_create(TEST_BUSNUM, TEST_DEVNUM, TEST_ID_VENDOR,
+                                      TEST_ID_PRODUCT, TEST_BCD_DEVICE);
+    if (guard == NULL)
+      _exit(2);
+
+    arm_two_interfaces(guard);
+    raise(SIGKILL);
+    _exit(3);
+  }
+
+  if (victim < 0)
+    return -1;
+
+  for (waited = 0; waited < SETTLE_TIMEOUT_MS; waited += SETTLE_POLL_MS) {
+    reaped = waitpid(victim, &status, WNOHANG);
+    if (reaped == victim)
+      break;
+    if (reaped < 0 && errno != EINTR)
+      return -1;
+    sleep_ms(SETTLE_POLL_MS);
+  }
+
+  if (reaped != victim) {
+    /* Wedged. Kill it so the suite does not leave it running; the intermediate
+     * it is waiting on is unkillable by anything short of SIGKILL and holds
+     * every descriptor the fork copied, which is the production symptom. */
+    kill(victim, SIGKILL);
+    while (waitpid(victim, NULL, 0) < 0 && errno == EINTR)
+      continue;
+    return -1;
+  }
+
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL)
+    return -1;
+
+  return 0;
+}
+
+/* THE cross-library case. libuvc's fork is never the only thing a fork does:
+ * glibc runs every pthread_atfork() handler registered anywhere in the process
+ * in the child of EVERY fork(), no matter which library called it or why. In
+ * cerastream that means libsrt's cleanupAtFork(), which takes an SRT mutex --
+ * and since fork() carries only the calling thread into the child, a mutex some
+ * other SRT thread held at that instant is locked in the child with nothing
+ * alive to unlock it. Captured on an RK3588 board as a child parked forever in
+ * pthread_mutex_lock() under srt::CUDTUnited::cleanupAtFork(), directly below
+ * uvc_reattach_guard_create(): helper_main() never ran, so the interfaces were
+ * never handed back AND the ~99 descriptors the fork copied -- the usbfs node,
+ * the ALSA capture device, the MPP encoder -- were held by a process that
+ * ignored every SIGTERM, blocking the next run from opening the same hardware.
+ * The guard therefore has to create its helper with a primitive glibc does not
+ * decorate with somebody else's handlers. */
+static int check_rebinds_despite_a_foreign_atfork_handler(void) {
+  CHECK(install_recorder(0));
+  CHECK(run_atfork_hostile_victim_then_sigkill() == 0);
+
+  wait_for_rebinds(2);
+
+  CHECK(recorder->opened == 1);
+  CHECK(recorder->rebound_count == 2);
+  CHECK(recorder->rebound[0] == 0);
+  CHECK(recorder->rebound[1] == 1);
+  CHECK(recorder->closed == 1);
   return EXIT_SUCCESS;
 }
 
@@ -612,6 +740,8 @@ int main(int argc, char **argv) {
     return check_disarmed_interfaces_are_not_rebound();
   if (strcmp(argv[2], "busy_interface_is_retried") == 0)
     return check_busy_interface_is_retried();
+  if (strcmp(argv[2], "rebinds_despite_a_foreign_atfork_handler") == 0)
+    return check_rebinds_despite_a_foreign_atfork_handler();
   if (strcmp(argv[2], "connect_ioctl_is_what_libusb_would_issue") == 0)
     return check_connect_ioctl_is_what_libusb_would_issue();
   if (strcmp(argv[2], "claiming_an_interface_arms_the_guard") == 0)
