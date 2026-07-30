@@ -137,13 +137,14 @@ jobs:
               "libuvc.reattach.rebinds_after_sigkill",
               "libuvc.reattach.disarmed_interfaces_are_not_rebound",
               "libuvc.reattach.busy_interface_is_retried",
+              "libuvc.reattach.rebinds_despite_a_foreign_atfork_handler",
               "libuvc.reattach.connect_ioctl_is_what_libusb_would_issue",
               "libuvc.reattach.claiming_an_interface_arms_the_guard",
               "libuvc.reattach.claim_failure_after_detach_reattaches",
               "libuvc.reattach.failed_reattach_after_failed_claim_stays_armed",
               "libuvc.reattach.detach_failure_leaves_nothing_armed",
               "libuvc.race.close_races_status_callback"
-            ] | sort) and (.tests | length == 36)
+            ] | sort) and (.tests | length == 37)
           ' "$result_dir/inventory.json" \
             2>&1 | tee "$result_dir/inventory-check.log"
 
