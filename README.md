@@ -1,7 +1,7 @@
 # CeraLive/libuvc
 
 This is the **CeraLive** fork of `libuvc`, maintained for the
-[`gstlibuvch264src`](https://github.com/CeraLive/gstlibuvch264src) GStreamer
+[`gstlibuvcsrc`](https://github.com/CERALIVE/gstlibuvcsrc) GStreamer
 capture element (DJI action cameras and UVC H.264/H.265 devices).
 
 **Forked from `libuvc/libuvc` at SHA `68d07a00e11d1944e27b7295ee69673239c00b4b`
